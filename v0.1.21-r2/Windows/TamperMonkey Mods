@@ -1,0 +1,3907 @@
+// ==UserScript==
+// @name Trinovation Auto Count Tracker
+// @namespace http://tampermonkey.net/
+// @version 0.1.21
+// @releaseRevision 2
+// @description Trinovation Auto Count Tracker v0.1.21 frontend with department-aware reporting and traceable diagnostics
+// @author JBallados
+// @match *://*.labeling-tools.augmoto.com/*
+// @match *://labeling-tools.augmoto.com/*
+// @grant GM_xmlhttpRequest
+// @grant GM_getValue
+// @grant GM_setValue
+// @grant GM_info
+// @connect localhost
+// @connect 127.0.0.1
+// @updateURL http://127.0.0.1:9000/tampermonkey.meta.js
+// @downloadURL http://127.0.0.1:9000/tampermonkey.user.js
+// @run-at document-end
+// ==/UserScript==
+
+
+(function () {
+    'use strict';
+
+    const SERVER = "http://127.0.0.1:9000";
+    const TRACKER_RELEASE_REVISION = 2;
+    const IDLE_TIMEOUT = 30 * 1000;
+    let idleTimer = null;
+    let lastActivityAt = Date.now();
+    let currentStatus = "WAITING";
+    let shiftStarted = false;
+    let shiftStartedAt = null;
+    let shiftEndedAt = null;
+    let shiftSchedule = null;
+    let overtimeState = null;
+    let controllerConnected = false;
+    let controllerVersion = null;
+    let controllerRevision = 0;
+    let lastControllerSeenAt = 0;
+    let latestReleaseState = null;
+    let updateInstallState = { state:'NONE', version:null, revision:null, restartRequired:false };
+    let eventSource = null;
+    let lastJobId = "";
+    let lastJobUrl = location.href;
+    let lastJobDescription = "";
+    let useLocalCounters = false;
+    let counterLocked = false;
+    let pendingReset = false;
+    let ignoreInitialStats = false;
+    let currentIntervalNumber = Number(GM_getValue("currentIntervalNumber", 1));
+    let currentIntervalStartedAt = null;
+    let submitLocked = false;
+    let submitRequestInProgress = false;
+    let trackerErrorLoggingInstalled = false;
+    let lastSseErrorReportAt = 0;
+    let firstTimeSetupNoticeShown = false;
+    let reportUploadSettingsDraftDirty = false;
+    let trackingMode = 0;
+    let lastHandledSubmitTime = 0;
+    const SUBMIT_DEBOUNCE_MS = 500;
+    const TRACKER_DOCK_WIDTH = 240;
+    const TRACKER_COLLAPSED_WIDTH = 42;
+    const TRACKER_FLOAT_WIDTH = 238;
+    const TRACKER_FLOAT_COMPACT_WIDTH = 218;
+    const TRACKER_FLOAT_COMPACT_HEIGHT = 128;
+    const savedDockSide = GM_getValue('trackerDockSide', 'right') === 'left' ? 'left' : 'right';
+    let trackerLayoutMode = GM_getValue('trackerLayoutMode', savedDockSide);
+    if (!['left', 'right', 'floating'].includes(trackerLayoutMode)) trackerLayoutMode = savedDockSide;
+    let trackerFloatLeft = Number(GM_getValue('trackerFloatLeft', 16));
+    let trackerFloatTop = Number(GM_getValue('trackerFloatTop', 80));
+    let trackerCollapsed = GM_getValue('trackerCollapsed', false) === true;
+    const legacyTrackerTheme = GM_getValue('trackerTheme', 'dark') === 'light' ? 'light' : 'dark';
+    let trackerUiColor = String(GM_getValue('trackerUiColor', legacyTrackerTheme === 'light' ? '#f8fafc' : '#18181b') || '#18181b');
+    let trackerAgentLastName = String(GM_getValue('trackerAgentLastName', '') || '').trim();
+    let reportSettingsState = {
+        lastName: trackerAgentLastName,
+        driveConfigured: false,
+        driveMode: 'unconfigured'
+    };
+    let reportUploadSettingsState = {
+        configured: false,
+        endpoint: '',
+        agentId: '',
+        agentName: '',
+        department: 'OOS',
+        pod: '',
+        deviceId: '',
+        credentialMode: 'unconfigured',
+        deviceRegistered: false,
+        tokenConfigured: false,
+        maxRetries: 3
+    };
+    let breakState = {
+        onBreak: false,
+        totalSeconds: 30 * 60,
+        usedSeconds: 0,
+        remainingSeconds: 30 * 60,
+        available: true,
+        expired: false,
+        supported: true,
+        allowanceMinutes: 30,
+        kind: 'BREAK',
+        label: 'Break',
+        activeKind: null,
+        availableKinds: ['BREAK'],
+        department: 'OOS'
+    };
+    let pauseStates = {
+        break: { ...breakState },
+        lunch: {
+            onBreak: false,
+            totalSeconds: 0,
+            usedSeconds: 0,
+            remainingSeconds: 0,
+            available: false,
+            expired: true,
+            supported: false,
+            allowanceMinutes: 0,
+            kind: 'LUNCH',
+            label: 'Lunch Break',
+            activeKind: null,
+            availableKinds: ['BREAK'],
+            department: 'OOS'
+        }
+    };
+    let breakCountdownAnchorAt = Date.now();
+    let breakCountdownAnchorRemainingSeconds = breakState.remainingSeconds;
+    let specialSessionState = {
+        activeType: null,
+        BIO: { totalSecondsPerSession: 900, maxSessions: 1, currentSession: 1, currentRemainingSeconds: 900, sessionsRemainingAfterCurrent: 0, exhausted: false, active: false },
+        HBIO: { totalSecondsPerSession: 600, maxSessions: 1, currentSession: 1, currentRemainingSeconds: 600, sessionsRemainingAfterCurrent: 0, exhausted: false, active: false }
+    };
+    let specialCountdownAnchorAt = Date.now();
+    let specialCountdownAnchorRemainingSeconds = 0;
+    let modeMismatchBypassNextAction = false;
+    let modeTimingStats = {
+        mode1: { activeSeconds: 0, idleSeconds: 0, breakSeconds: 0, bioSeconds: 0, hbioSeconds: 0 },
+        mode2: { activeSeconds: 0, idleSeconds: 0, breakSeconds: 0, bioSeconds: 0, hbioSeconds: 0 }
+    };
+    let liveTimingAnchorAt = Date.now();
+    let liveTimingAnchorMode = trackingMode;
+    let liveTimingAnchorStatus = currentStatus;
+    let localCounters = {
+        totalTaskCompleted: 0,
+        totalJobsCompleted: 0
+    };
+    let mode2Stats = {
+        mode2TaskCompleted: 0,
+        mode2JobsCompleted: 0,
+        mode2DeletedBoxes: 0,
+        mode2EmptyAreaConfirmation: 0,
+        mode2EmptyAreaNoMatchFound: 0,
+        mode2UnblurredPerson: 0,
+        mode2SkippedTask: 0
+    };
+
+// =========================================
+// FUNCTION TRACKER BROWSER INFO
+// Search: getTrackerBrowserInfo
+// Ver 0.1.18 Alpha || 2026-09-29 || JBallados || Browser_Aware_Update
+// =========================================
+function getTrackerBrowserInfo() {
+
+    const ua = String(navigator.userAgent || '');
+    const brands = Array.isArray(navigator.userAgentData?.brands)
+        ? navigator.userAgentData.brands.map(item => String(item.brand || '')).join(' ')
+        : '';
+    const source = (brands + ' ' + ua).toLowerCase();
+    let name = 'Unknown Browser';
+    if (navigator.brave) name = 'Brave';
+    else if (source.includes('zen')) name = 'Zen Browser';
+    else if (source.includes('opr/') || source.includes('opera')) name = 'Opera';
+    else if (source.includes('edg/')) name = 'Microsoft Edge';
+    else if (source.includes('firefox/')) name = 'Mozilla Firefox';
+    else if (source.includes('chrome/') || source.includes('chromium')) name = 'Google Chrome';
+    return { name, userAgent: ua.slice(0, 500), platform: String(navigator.platform || '').slice(0, 120) };
+
+}
+
+function getInstalledTrackerVersion() {
+    try { return String(GM_info?.script?.version || 'unknown'); } catch { return 'unknown'; }
+}
+
+function getInstalledTrackerRevision() {
+    return TRACKER_RELEASE_REVISION;
+}
+
+function formatTrackerTime(timestamp) {
+    return timestamp
+        ? new Date(timestamp).toLocaleTimeString('en-US', { timeZone: 'Asia/Manila', hour12: true })
+        : 'N/A';
+}
+
+function renderUpdateInstallControls() {
+    const installButton = $('tracker-install-release-btn');
+    const restartButton = $('tracker-restart-controller-btn');
+    const status = $('tracker-update-install-status');
+
+    const integrityWarning = Boolean(latestReleaseState?.integrityWarning);
+    const updateAvailable = Boolean(latestReleaseState?.updateAvailable && latestReleaseState?.latestVersion);
+    const staged = updateInstallState?.state === 'STAGED' && updateInstallState?.restartRequired;
+
+    if (installButton) {
+        installButton.disabled = integrityWarning || staged;
+        installButton.textContent = integrityWarning
+            ? 'Update Blocked — Checksum Warning'
+            : staged
+                ? 'Update Files Installed'
+                : updateAvailable
+                    ? 'Install v' + latestReleaseState.latestVersion + '-r' + Number(latestReleaseState.latestRevision || 0)
+                    : 'Check & Install Auto Tracker Update';
+    }
+    if (restartButton) restartButton.style.display = staged ? 'block' : 'none';
+    if (status) {
+        status.textContent = integrityWarning
+            ? 'Update install: blocked because Drive release checksums changed.'
+            : staged
+                ? 'Update install: v' + updateInstallState.version + '-r' + Number(updateInstallState.revision || 0) + ' staged. Approve Tampermonkey, then restart.'
+                : updateInstallState?.state === 'FAILED'
+                    ? 'Update install: failed (' + String(updateInstallState.error || 'unknown') + ').'
+                    : updateAvailable
+                        ? 'Update install: v' + latestReleaseState.latestVersion + '-r' + Number(latestReleaseState.latestRevision || 0) + ' is ready to install.'
+                        : 'Update install: no pending installation.';
+    }
+}
+
+function renderControllerIdentity() {
+    const browser = getTrackerBrowserInfo().name;
+    const tmVersion = getInstalledTrackerVersion();
+    const tmRevision = getInstalledTrackerRevision();
+    const ctrl = controllerConnected && controllerVersion
+        ? 'v' + controllerVersion + '-r' + Number(controllerRevision || 0)
+        : 'DISCONNECTED';
+    const mismatch = Boolean(
+        controllerConnected
+        && controllerVersion
+        && tmVersion !== 'unknown'
+        && (
+            String(controllerVersion) !== String(tmVersion)
+            || Number(controllerRevision || 0) !== Number(tmRevision || 0)
+        )
+    );
+    const updateAvailable = Boolean(latestReleaseState?.updateAvailable && latestReleaseState?.latestVersion);
+    const integrityWarning = Boolean(latestReleaseState?.integrityWarning);
+    const updateLabel = updateAvailable
+        ? ' | UPDATE v' + latestReleaseState.latestVersion + '-r' + Number(latestReleaseState.latestRevision || 0)
+        : integrityWarning ? ' | ⚠ RELEASE CHANGED' : '';
+    const status = $('tracker-version-status');
+    if (status) {
+        status.textContent = 'CTRL ' + ctrl + ' | TM v' + tmVersion + '-r' + tmRevision
+            + (mismatch ? ' ⚠ MISMATCH' : '')
+            + updateLabel;
+        status.style.color = mismatch || updateAvailable || integrityWarning ? 'var(--tracker-warning)' : 'var(--tracker-muted)';
+    }
+    const diag = $('tracker-runtime-status');
+    if (diag) {
+        diag.textContent = 'Controller: ' + ctrl + ' • Tampermonkey: v' + tmVersion + '-r' + tmRevision + ' • Browser: ' + browser
+            + (mismatch ? ' • Version/revision mismatch' : '')
+            + (updateAvailable ? ' • New: v' + latestReleaseState.latestVersion + '-r' + Number(latestReleaseState.latestRevision || 0) : '')
+            + (integrityWarning ? ' • Release checksum warning' : '');
+    }
+    renderUpdateInstallControls();
+}
+
+function setControllerConnection(connected, data = null) {
+    controllerConnected = Boolean(connected);
+    if (connected) {
+        lastControllerSeenAt = Date.now();
+        if (data?.controllerVersion) controllerVersion = String(data.controllerVersion);
+        if (data?.controllerRevision !== undefined) controllerRevision = Math.max(0, Number(data.controllerRevision) || 0);
+    }
+    renderControllerIdentity();
+    renderShiftWall();
+}
+
+// =========================================
+// FUNCTION APPLY SERVER INTERVAL
+// Search: applyServerInterval
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function applyServerInterval(stats) {
+
+    if (!stats || !stats.currentInterval || stats.currentInterval.number === undefined) {
+        console.warn("⚠️ Server did not provide a valid interval.");
+        return;
+    }
+    const serverInterval = Number(stats.currentInterval.number);
+    if (!Number.isFinite(serverInterval) || serverInterval < 1) {
+        console.warn("⚠️ Invalid server interval:", stats.currentInterval.number);
+        return;
+    }
+    currentIntervalNumber = serverInterval;
+    console.log("🔢 Interval synchronized from server:", currentIntervalNumber);
+    if ($("interval")) {
+        $("interval").innerText = getIntervalName(currentIntervalNumber);
+    }
+
+}
+
+// =========================================
+// FUNCTION INITIALIZE LOCAL COUNTERS FROM STATS
+// Search: initializeLocalCountersFromStats
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function initializeLocalCountersFromStats(stats) {
+
+    if (!stats) return;
+    localCounters.totalTaskCompleted = stats.intervalCounters?.mode1?.taskCompleted ?? stats.allTimeTasks ?? stats.totalTaskCompleted ?? 0;
+    localCounters.totalJobsCompleted = stats.intervalCounters?.mode1?.jobsCompleted ?? stats.totalJobsCompleted ?? 0;
+    applyServerInterval(stats);
+    if (pendingReset || ignoreInitialStats) {
+        counterLocked = true;
+        useLocalCounters = true;
+        pendingReset = false;
+        ignoreInitialStats = false;
+    } else {
+        counterLocked = false;
+        useLocalCounters = true;
+    }
+    updateStats(stats);
+
+}
+
+// =========================================
+// FUNCTION $
+// Search: $
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function $(id) {
+
+    return document.getElementById(id);
+
+}
+
+// =========================================
+// FUNCTION PAGE TEXT
+// Search: pageText
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function pageText() {
+
+    if (!document.body) return '';
+    const body = document.body.cloneNode(true);
+    body.querySelectorAll('#tracker-overlay, script, style, noscript').forEach(el => el.remove());
+    return body.innerText || body.textContent || '';
+
+}
+
+// =========================================
+// FUNCTION GET JOB ID
+// Search: getJobId
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function getJobId() {
+
+    const route = location.pathname.match(/\/jobs\/(JOB_\d+)(?:\/|$)/i);
+    if (route) return route[1];
+    const match = pageText().match(/JOB_\d+/i);
+    return match ? match[0] : 'None';
+
+}
+    let previousJobId = null;
+
+// =========================================
+// FUNCTION UPDATE JOB DISPLAY
+// Search: updateJobDisplay
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function updateJobDisplay() {
+
+    const currentJob = getJobId();
+    if ($('job')) $('job').innerText = currentJob;
+    if ($('floating-job')) $('floating-job').innerText = currentJob;
+    const taskData = getCurrentTaskPosition();
+    const taskText = taskData ? `${taskData.position} / ${taskData.total}` : 'N/A';
+    if ($('task-number')) $('task-number').innerText = taskText;
+    if ($('floating-task')) $('floating-task').innerText = taskText;
+
+}
+
+// =========================================
+// FUNCTION PH TIME
+// Search: phTime
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function phTime() {
+
+    return new Date().toLocaleTimeString("en-US", {
+        timeZone: "Asia/Manila"
+    });
+
+}
+
+// =========================================
+// FUNCTION CREATE REQUEST ID
+// Search: createRequestId
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function createRequestId() {
+
+    return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+
+}
+
+// =========================================
+// FUNCTION PH DATE TIME
+// Search: phDateTime
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function phDateTime() {
+
+    return new Date().toLocaleString("en-US", {
+        timeZone: "Asia/Manila",
+        year: "numeric",
+        month: "numeric",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true
+    });
+
+}
+
+function createTrackerTraceId(prefix = 'REQ') {
+
+    const safePrefix = String(prefix || 'REQ').toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 12) || 'REQ';
+    let randomPart = '';
+    try {
+        const bytes = new Uint8Array(4);
+        crypto.getRandomValues(bytes);
+        randomPart = Array.from(bytes).map(value => value.toString(16).padStart(2, '0')).join('').toUpperCase();
+    } catch {
+        randomPart = Math.random().toString(16).slice(2, 10).toUpperCase();
+    }
+    return safePrefix + '-' + Date.now().toString(36).toUpperCase() + '-' + randomPart;
+
+}
+
+function redactTrackerLogValue(value, maxLength = 1600) {
+
+    let text = String(value ?? '');
+    text = text
+        .replace(/(Bearer\s+)[A-Za-z0-9._~+\/-]+/gi, '$1[REDACTED]')
+        .replace(/((?:registrationToken|deviceToken|teamLeadToken|authorization|password|secret|cookie)\s*["']?\s*[:=]\s*["']?)[^"',}\s]+/gi, '$1[REDACTED]')
+        .replace(/\b[a-f0-9]{64}\b/gi, '[REDACTED_TOKEN]');
+    return text.slice(0, Math.max(0, Number(maxLength) || 0));
+
+}
+
+function sanitizeTrackerLogObject(value) {
+
+    try {
+        return JSON.parse(JSON.stringify(value == null ? {} : value, (key, item) => {
+            if (/token|secret|password|authorization|cookie|fileBase64/i.test(key)) return item ? '[REDACTED]' : item;
+            if (typeof item === 'string') return redactTrackerLogValue(item, 1600);
+            return item;
+        }));
+    } catch {
+        return { loggingError: 'Context could not be serialized safely.' };
+    }
+
+}
+
+// =========================================
+// FUNCTION API
+// Search: api
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function api(method, endpoint, data, callback) {
+
+    const traceId = createTrackerTraceId('REQ');
+    const startedAt = Date.now();
+    const safeLogData = sanitizeTrackerLogObject(data);
+    console.log('🌐 API REQUEST [' + traceId + ']:', method, endpoint, safeLogData);
+    GM_xmlhttpRequest({
+        method,
+        url: SERVER + endpoint,
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Tracker-Trace-Id': traceId
+        },
+        data: data ? JSON.stringify(data) : undefined,
+        timeout: 15000,
+        onload(res) {
+            const responsePreview = redactTrackerLogValue(res.responseText || '', 1600);
+            const durationMs = Math.max(0, Date.now() - startedAt);
+            console.log('📥 API RESPONSE [' + traceId + ']:', res.status, durationMs + 'ms', responsePreview);
+            let parsed = null;
+            try {
+                parsed = JSON.parse(res.responseText);
+                setControllerConnection(true, parsed);
+            } catch (error) {
+                reportTrackerClientError('api.json_parse', error, {
+                    errorCode: 'ERR-FRONTEND-API-JSON',
+                    severity: 'ERROR',
+                    traceId,
+                    method,
+                    endpoint,
+                    httpStatus: res.status,
+                    durationMs,
+                    responsePreview
+                });
+                if (callback) callback(null);
+                return;
+            }
+            if (Number(res.status) >= 400) {
+                const httpError = new Error(
+                    String(parsed?.message || parsed?.error || ('Controller returned HTTP ' + res.status))
+                );
+                reportTrackerClientError('api.http_error', httpError, {
+                    errorCode: Number(res.status) >= 500 ? 'ERR-FRONTEND-API-5XX' : 'ERR-FRONTEND-API-4XX',
+                    severity: Number(res.status) >= 500 ? 'ERROR' : 'WARN',
+                    traceId,
+                    method,
+                    endpoint,
+                    httpStatus: res.status,
+                    durationMs,
+                    responsePreview
+                });
+            }
+            if (callback) callback(parsed);
+        },
+        onerror(error) {
+            controllerConnected = false;
+            renderControllerIdentity();
+            renderShiftWall();
+            const requestError = new Error(
+                'Request failed: ' + redactTrackerLogValue(error?.error || error?.message || 'network error', 500)
+            );
+            console.error('❌ API REQUEST ERROR [' + traceId + ']:', error);
+            reportTrackerClientError('api.network_error', requestError, {
+                errorCode: 'ERR-FRONTEND-API-NETWORK',
+                severity: 'ERROR',
+                traceId,
+                method,
+                endpoint,
+                durationMs: Math.max(0, Date.now() - startedAt)
+            });
+            if (callback) callback(null);
+        },
+        ontimeout() {
+            controllerConnected = false;
+            renderControllerIdentity();
+            renderShiftWall();
+            console.error('❌ API REQUEST TIMEOUT [' + traceId + ']');
+            reportTrackerClientError('api.timeout', new Error('Controller request timed out after 15 seconds.'), {
+                errorCode: 'ERR-FRONTEND-API-TIMEOUT',
+                severity: 'WARN',
+                traceId,
+                method,
+                endpoint,
+                durationMs: Math.max(0, Date.now() - startedAt)
+            });
+            if (callback) callback(null);
+        }
+    });
+
+}
+
+// =========================================
+// FUNCTION REPORT TRACKER CLIENT ERROR
+// Search: reportTrackerClientError
+// Ver 0.1.16 Alpha || 2026-09-28 || JBallados || Error_Logging
+// =========================================
+function reportTrackerClientError(eventType, error, context = {}) {
+
+    try {
+        const message = error instanceof Error ? error.message : String(error || 'Unknown tracker error');
+        const stack = error instanceof Error && error.stack ? String(error.stack) : '';
+        const safeContext = sanitizeTrackerLogObject(context || {});
+        const traceId = String(safeContext.traceId || createTrackerTraceId('FE')).slice(0, 120);
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url: SERVER + '/',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Tracker-Trace-Id': traceId
+            },
+            data: JSON.stringify({
+                action: 'client_error',
+                eventType: String(eventType || 'client-error').slice(0, 80),
+                errorName: error instanceof Error ? String(error.name || 'Error').slice(0, 120) : 'Error',
+                errorCode: String(safeContext.errorCode || 'ERR-FRONTEND-CLIENT').slice(0, 96),
+                severity: String(safeContext.severity || 'ERROR').slice(0, 16),
+                traceId,
+                message: redactTrackerLogValue(message, 3000),
+                stack: redactTrackerLogValue(stack, 10000),
+                page: location.origin + location.pathname,
+                trackerVersion: GM_info?.script?.version || 'unknown',
+                controllerVersion: controllerVersion || 'disconnected',
+                browser: getTrackerBrowserInfo().name,
+                trackerStatus: currentStatus,
+                trackingMode,
+                shiftStarted,
+                currentJobId: lastJobId || '',
+                method: String(safeContext.method || '').slice(0, 20),
+                endpoint: String(safeContext.endpoint || '').slice(0, 500),
+                httpStatus: Number(safeContext.httpStatus || 0) || null,
+                durationMs: Number(safeContext.durationMs || 0) || null,
+                responsePreview: redactTrackerLogValue(safeContext.responsePreview || '', 1200)
+            }),
+            timeout: 5000
+        });
+        return traceId;
+    } catch {
+        return null;
+    }
+
+}
+
+// =========================================
+// FUNCTION INSTALL TRACKER CLIENT ERROR LOGGING
+// Search: installTrackerClientErrorLogging
+// Ver 0.1.16 Alpha || 2026-09-28 || JBallados || Error_Logging
+// =========================================
+function installTrackerClientErrorLogging() {
+
+    if (trackerErrorLoggingInstalled) return;
+    trackerErrorLoggingInstalled = true;
+    window.addEventListener('error', event => {
+        reportTrackerClientError('window.error', event.error || new Error(String(event.message || 'Window error')));
+    });
+    window.addEventListener('unhandledrejection', event => {
+        const reason = event.reason instanceof Error ? event.reason : new Error(String(event.reason || 'Unhandled promise rejection'));
+        reportTrackerClientError('unhandledrejection', reason);
+    });
+
+}
+
+// =========================================
+// FUNCTION GET INTERVAL NAME
+// Search: getIntervalName
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function getIntervalName(number) {
+
+    if (number === 1) return "1ST";
+    if (number === 2) return "2ND";
+    if (number === 3) return "3RD";
+    return `${number}TH`;
+
+}
+
+// =========================================
+// FUNCTION CREATE OVERLAY
+// Search: createOverlay
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Settings_Draft_Title_Position
+// =========================================
+function createOverlay(stats) {
+
+    if ($('tracker-overlay')) return;
+    const overlay = document.createElement('aside');
+    overlay.id = 'tracker-overlay';
+    overlay.innerHTML = `
+<style>
+#tracker-overlay * { box-sizing:border-box; }
+#tracker-overlay .tracker-button { width:100%; border:1px solid #3f3f46; background:var(--tracker-header); color:var(--tracker-text); border-radius:7px; padding:6px 7px; font:11px Segoe UI,sans-serif; cursor:pointer; transition:background .15s ease,border-color .15s ease,transform .15s ease; }
+#tracker-overlay .tracker-button:hover:not(:disabled) { background:#3f3f46; }
+#tracker-overlay .tracker-button:disabled { opacity:.45; cursor:not-allowed; }
+#tracker-overlay .tracker-button.active { border-color:#4ade80; background:#14532d; box-shadow:0 0 0 1px rgba(74,222,128,.18); }
+#tracker-overlay {
+    --tracker-bg:#18181b;
+    --tracker-surface:#27272a;
+    --tracker-surface-2:#202024;
+    --tracker-border:#3f3f46;
+    --tracker-text:#f8fafc;
+    --tracker-muted:#a1a1aa;
+    --tracker-header:#111113;
+    --tracker-success:#4ade80;
+    --tracker-warning:#facc15;
+    --tracker-danger:#f87171;
+}
+#tracker-overlay,
+#tracker-overlay #tracker-dock-header { color:var(--tracker-text) !important; }
+#tracker-overlay #tracker-dock-header { background:var(--tracker-header) !important; border-color:var(--tracker-border) !important; }
+#tracker-overlay #tracker-header-identity { min-width:0; overflow:hidden; line-height:1.05; }
+#tracker-overlay #tracker-title-full { display:block; max-width:100%; overflow:hidden; text-overflow:clip; white-space:nowrap; font:700 8.5px/1.05 "Segoe UI",sans-serif; letter-spacing:-.15px; }
+#tracker-overlay #tracker-version-status { display:block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:7.5px/1.1 monospace; }
+#tracker-overlay #tracker-header-actions { display:flex; align-items:center; gap:5px; flex:0 0 auto; }
+#tracker-overlay #tracker-layout-label { display:none !important; }
+#tracker-overlay .tracker-button { background:var(--tracker-surface) !important; color:var(--tracker-text) !important; border-color:var(--tracker-border) !important; }
+#tracker-overlay .tracker-button:hover:not(:disabled) { filter:brightness(1.08); }
+#tracker-overlay .tracker-button.active { border-color:#22c55e !important; background:#14532d !important; color:#f8fafc !important; }
+#tracker-overlay .tracker-button.tracker-primary { border-color:#22c55e !important; background:linear-gradient(135deg,#166534,#15803d) !important; color:var(--tracker-text) !important; }
+#tracker-overlay .tracker-time-chip,
+#tracker-overlay .floating-card,
+#tracker-overlay .tracker-section { background:var(--tracker-surface-2) !important; border-color:var(--tracker-border) !important; }
+#tracker-overlay .tracker-row strong,
+#tracker-overlay .tracker-time-chip strong { color:var(--tracker-text) !important; }
+#tracker-overlay .tracker-field { background:var(--tracker-surface) !important; color:var(--tracker-text) !important; border-color:var(--tracker-border) !important; }
+#tracker-overlay .tracker-label,
+#tracker-overlay .tracker-time-chip span { color:var(--tracker-muted) !important; }
+#tracker-overlay.tracker-floating #tracker-settings-panel { display:none !important; }
+#tracker-overlay.tracker-floating #tracker-header-settings-btn { display:none !important; }
+#tracker-overlay .tracker-subsection { margin-top:10px; padding-top:9px; border-top:1px solid var(--tracker-border); }
+#tracker-overlay .tracker-subsection-title { color:var(--tracker-muted); font:700 10px Segoe UI,sans-serif; letter-spacing:.35px; margin-bottom:4px; }
+#tracker-overlay .tracker-section-title,
+#tracker-overlay .floating-card-title,
+#tracker-overlay #tracker-layout-label,
+#tracker-overlay #tracker-device-id { color:var(--tracker-muted) !important; }
+#tracker-overlay .tracker-row > span:not(#status):not(#floating-status),
+#tracker-overlay .tracker-row > label { color:var(--tracker-muted) !important; }
+#tracker-overlay .tracker-row strong { color:var(--tracker-text) !important; }
+#tracker-overlay #status,
+#tracker-overlay #floating-status { color:var(--tracker-warning) !important; }
+#tracker-overlay #floating-mode,
+#tracker-overlay .tracker-section-title.mode-active { color:var(--tracker-success) !important; }
+#tracker-overlay #break-countdown,
+#tracker-overlay #bio-session-status,
+#tracker-overlay #hbio-session-status,
+#tracker-overlay #floating-bio-status,
+#tracker-overlay #floating-hbio-status { color:var(--tracker-text) !important; }
+#tracker-overlay input::placeholder { color:var(--tracker-muted) !important; opacity:.78; }
+#tracker-overlay input:disabled,
+#tracker-overlay select:disabled { color:var(--tracker-muted) !important; }
+#tracker-overlay .tracker-button.tracker-primary { border-color:#22c55e; background:linear-gradient(135deg,#166534,#15803d); font-weight:700; }
+#tracker-overlay .tracker-button.tracker-primary:hover:not(:disabled) { background:linear-gradient(135deg,#15803d,#16a34a); }
+#tracker-overlay .tracker-field { width:100%; margin-top:4px; border:1px solid #3f3f46; border-radius:7px; background:var(--tracker-bg); color:var(--tracker-text); padding:7px; font:11px Segoe UI,sans-serif; }
+#tracker-overlay .tracker-label { display:block; margin-top:8px; color:var(--tracker-muted); font:10px Segoe UI,sans-serif; }
+#tracker-settings-panel { display:none; padding:10px; font-family:Segoe UI,sans-serif; overflow-y:auto; max-height:calc(100vh - 42px); }
+#tracker-overlay.tracker-settings-open #tracker-content,
+#tracker-overlay.tracker-settings-open #tracker-floating-summary,
+#tracker-overlay.tracker-settings-open #tracker-break-panel { display:none !important; }
+#tracker-overlay.tracker-settings-open:not(.tracker-collapsed) #tracker-settings-panel { display:block; }
+#tracker-overlay.tracker-light { background:#f8fafc !important; color:#0f172a !important; border-color:#cbd5e1 !important; }
+#tracker-overlay.tracker-light #tracker-dock-header { background:#e2e8f0 !important; border-color:#cbd5e1 !important; color:#0f172a !important; }
+#tracker-overlay.tracker-light .tracker-button { background:#fff; color:#0f172a; border-color:#cbd5e1; }
+#tracker-overlay.tracker-light .tracker-button:hover:not(:disabled) { background:#f1f5f9; }
+#tracker-overlay.tracker-light .tracker-button.active { background:#dcfce7; color:#14532d; border-color:#22c55e; }
+#tracker-overlay.tracker-light .tracker-button.tracker-primary { background:linear-gradient(135deg,#16a34a,#22c55e); color:var(--tracker-text); }
+#tracker-overlay.tracker-light .tracker-time-chip,
+#tracker-overlay.tracker-light .floating-card { background:#fff; border-color:#cbd5e1; }
+#tracker-overlay.tracker-light .tracker-time-chip strong,
+#tracker-overlay.tracker-light .tracker-row strong { color:#0f172a; }
+#tracker-overlay.tracker-light .tracker-field { background:#fff; color:#0f172a; border-color:#cbd5e1; }
+#tracker-overlay.tracker-light .tracker-section { border-color:#cbd5e1; }
+#tracker-overlay #bio-session-status,
+#tracker-overlay #hbio-session-status,
+#tracker-overlay #floating-bio-status,
+#tracker-overlay #floating-hbio-status { color:var(--tracker-text) !important; }
+#tracker-overlay.tracker-light #bio-session-status,
+#tracker-overlay.tracker-light #hbio-session-status,
+#tracker-overlay.tracker-light #floating-bio-status,
+#tracker-overlay.tracker-light #floating-hbio-status { color:#0f172a !important; }
+#tracker-overlay .tracker-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+#tracker-overlay .tracker-row { display:flex; justify-content:space-between; gap:8px; margin:3px 0; }
+#tracker-overlay .tracker-timing-strip { display:grid; grid-template-columns:repeat(3,1fr); gap:4px; margin:6px 0 2px; }
+#tracker-overlay .tracker-time-chip { min-width:0; padding:5px 3px; border:1px solid #3f3f46; border-radius:8px; background:#202024; text-align:center; }
+#tracker-overlay .tracker-time-chip span { display:block; color:var(--tracker-muted); font:9px Segoe UI,sans-serif; line-height:1.05; }
+#tracker-overlay .tracker-time-chip strong { display:block; margin-top:2px; color:var(--tracker-text); font:10px monospace; white-space:nowrap; }
+#tracker-overlay .tracker-section { border-top:1px solid #3f3f46; margin-top:8px; padding-top:8px; }
+#tracker-overlay .tracker-section-title { font-weight:700; color:var(--tracker-muted); margin-bottom:5px; transition:color .2s ease,text-shadow .2s ease; }
+#tracker-overlay .tracker-section-title.mode-active { color:#4ade80; text-shadow:0 0 8px rgba(74,222,128,.55); }
+#tracker-overlay .tracker-section-title.mode-active::before { content:'● '; animation:trackerModePulse 1.2s ease-in-out infinite; }
+@keyframes trackerModePulse { 0%,100% { opacity:.35; } 50% { opacity:1; } }
+
+#tracker-overlay details.tracker-dropdown { margin-top:8px; border:1px solid var(--tracker-border); border-radius:9px; background:var(--tracker-surface-2); overflow:hidden; }
+#tracker-overlay details.tracker-dropdown > summary { list-style:none; display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:30px; padding:7px 8px; cursor:pointer; user-select:none; color:var(--tracker-text); font:700 10px/1.2 "Segoe UI",sans-serif; letter-spacing:.2px; }
+#tracker-overlay details.tracker-dropdown > summary::-webkit-details-marker { display:none; }
+#tracker-overlay details.tracker-dropdown > summary::after { content:'▾'; flex:0 0 auto; color:var(--tracker-muted); font-size:11px; transition:transform .16s ease; }
+#tracker-overlay details.tracker-dropdown[open] > summary::after { transform:rotate(180deg); }
+#tracker-overlay details.tracker-dropdown > .tracker-dropdown-body { padding:0 8px 8px; border-top:1px solid var(--tracker-border); }
+#tracker-overlay details.tracker-dropdown .tracker-section { margin-top:6px; padding-top:6px; }
+#tracker-overlay details.tracker-dropdown .tracker-section:first-child { border-top:0; }
+#tracker-overlay.tracker-light details.tracker-dropdown { background:#fff !important; border-color:#cbd5e1 !important; }
+#tracker-overlay.tracker-light details.tracker-dropdown > summary { color:#0f172a !important; }
+#tracker-overlay .floating-compact-label { display:none; }
+
+#tracker-floating-summary { display:none; padding:9px; font-family:monospace; }
+#tracker-overlay.tracker-floating #tracker-content { display:none; }
+#tracker-overlay.tracker-floating:not(.tracker-collapsed) #tracker-floating-summary { display:block; }
+#tracker-overlay.tracker-floating #tracker-dock-header { height:38px !important; padding:5px 7px !important; cursor:move; border-radius:13px 13px 0 0; }
+#tracker-overlay.tracker-floating #tracker-title-full { font-size:10px !important; }
+#tracker-overlay.tracker-floating { border-radius:14px !important; box-shadow:0 10px 32px rgba(0,0,0,.48) !important; }
+#tracker-overlay.tracker-collapsed #tracker-content,
+#tracker-overlay.tracker-collapsed #tracker-floating-summary,
+#tracker-overlay.tracker-collapsed #tracker-dock-header,
+#tracker-overlay.tracker-collapsed #tracker-notice { display:none !important; }
+#tracker-overlay #tracker-expand-middle { display:none; }
+#tracker-overlay.tracker-collapsed #tracker-expand-middle { display:flex !important; }
+#tracker-collapsed-drag-handle { display:none; }
+
+#tracker-overlay.tracker-floating.tracker-collapsed #tracker-floating-summary { display:block !important; padding:30px 7px 7px; overflow:hidden; }
+#tracker-overlay.tracker-floating.tracker-collapsed #tracker-floating-summary > :not(.tracker-floating-essential) { display:none !important; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential { display:block !important; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential .floating-compact-label { display:block; position:absolute; top:8px; left:38px; right:38px; text-align:center; color:var(--tracker-muted); font:700 8px/1 monospace; letter-spacing:.3px; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential .floating-compact-hide { display:none !important; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential .tracker-timing-strip { margin-top:4px; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential .tracker-time-chip { padding:3px 2px; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential .tracker-time-chip span { font-size:8px; }
+#tracker-overlay.tracker-floating.tracker-collapsed .tracker-floating-essential .tracker-time-chip strong { font-size:9px; }
+#tracker-overlay.tracker-floating.tracker-collapsed #tracker-expand-middle { display:flex !important; position:absolute !important; top:5px !important; right:6px !important; left:auto !important; transform:none !important; width:27px !important; min-width:27px !important; height:22px !important; padding:0 !important; font-size:15px !important; border-radius:7px !important; box-shadow:none !important; z-index:7 !important; }
+#tracker-overlay.tracker-floating.tracker-collapsed #tracker-collapsed-drag-handle { display:flex; position:absolute; top:5px; left:6px; width:27px; height:22px; align-items:center; justify-content:center; border:1px solid var(--tracker-border); border-radius:7px; background:var(--tracker-surface); color:var(--tracker-muted); font:11px monospace; cursor:grab; user-select:none; z-index:7; }
+#tracker-overlay.tracker-floating.tracker-collapsed #tracker-collapsed-drag-handle:active { cursor:grabbing; }
+#tracker-overlay.tracker-warning { border-color:#f59e0b !important; }
+#tracker-notice { display:none; margin:6px 8px 0; padding:7px; border-radius:8px; font:11px Segoe UI,sans-serif; background:#422006; border:1px solid #f59e0b; color:#fde68a; }
+#tracker-overlay .tracker-end-shift { border-color:var(--tracker-warning) !important; font-weight:700; }
+#trinovation-shift-wall { position:fixed; inset:0; z-index:999998; display:none; align-items:center; justify-content:center; background:rgba(2,6,23,.88); backdrop-filter:blur(4px); font-family:Segoe UI,sans-serif; }
+#trinovation-shift-wall .shift-wall-card { width:min(460px,calc(100vw - 32px)); border:1px solid #f59e0b; border-radius:16px; background:#111827; color:#f8fafc; padding:22px; box-shadow:0 20px 70px rgba(0,0,0,.5); text-align:center; }
+#trinovation-shift-wall .shift-wall-title { font-size:20px; font-weight:800; margin-bottom:8px; }
+#trinovation-shift-wall .shift-wall-status { color:#fde68a; font-size:13px; line-height:1.45; margin-bottom:15px; }
+#trinovation-shift-wall .shift-wall-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
+#trinovation-shift-wall button { width:100%; border:1px solid #475569; border-radius:9px; background:#1f2937; color:#f8fafc; padding:10px; cursor:pointer; font-weight:700; }
+#trinovation-shift-wall button.primary { background:#15803d; border-color:#22c55e; }
+#trinovation-shift-wall button:disabled { opacity:.5; cursor:not-allowed; }
+#floating-mode { color:#4ade80; font-weight:700; }
+#tracker-floating-summary .floating-card { margin-top:7px; padding:7px 8px; border:1px solid #3f3f46; border-radius:10px; background:rgba(39,39,42,.72); }
+#tracker-floating-summary .floating-card-title { margin-bottom:5px; color:var(--tracker-muted); font-weight:700; }
+#tracker-floating-summary .floating-card.active-mode { border-color:#4ade80; box-shadow:0 0 0 1px rgba(74,222,128,.12); }
+#tracker-overlay.tracker-floating #floating-mode1-card,
+#tracker-overlay.tracker-floating #floating-mode2-card { display:none; }
+#tracker-overlay.tracker-floating.tracker-mode1-selected #floating-mode1-card { display:block; }
+#tracker-overlay.tracker-floating.tracker-mode2-selected #floating-mode2-card { display:block; }
+#tracker-break-panel { display:none; padding:14px 9px 10px; font-family:monospace; }
+#tracker-overlay.tracker-break-focus #tracker-content,
+#tracker-overlay.tracker-break-focus #tracker-floating-summary,
+#tracker-overlay.tracker-break-focus #tracker-notice { display:none !important; }
+#tracker-overlay.tracker-break-focus:not(.tracker-collapsed) #tracker-break-panel { display:block; }
+#tracker-overlay.tracker-floating.tracker-break-focus #tracker-break-panel { padding:12px 9px 9px; }
+#tracker-overlay { transition:width .18s ease,height .18s ease,border-radius .18s ease,box-shadow .18s ease; }
+</style>
+<div id="tracker-dock-header" style="height:42px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:6px;padding:6px 7px;background:var(--tracker-header);border-bottom:1px solid #3f3f46;">
+    <div id="tracker-header-identity">
+        <strong id="tracker-title-full">TRINOVATION AUTO COUNT TRACKER</strong>
+        <span id="tracker-version-status" style="color:var(--tracker-muted);">CTRL CHECKING | TM v0.1.21-r2</span>
+    </div>
+    <div id="tracker-header-actions">
+        <span id="tracker-layout-label">DOCK</span>
+        <button type="button" class="tracker-button" id="tracker-header-settings-btn" data-tracker-action="settings" aria-label="Tracker settings" title="Tracker settings" style="width:30px;min-width:30px;padding:4px 0;font-size:13px;">⚙</button>
+        <button type="button" class="tracker-button" id="tracker-collapse-btn" data-tracker-action="collapse" aria-label="Minimize tracker" title="Minimize tracker" style="width:30px;min-width:30px;padding:4px 0;font-size:14px;">−</button>
+    </div>
+</div>
+<button type="button" class="tracker-button" id="tracker-expand-middle" data-tracker-action="collapse" aria-label="Maximize tracker" title="Maximize tracker" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:34px;height:88px;align-items:center;justify-content:center;padding:0;font-size:19px;font-weight:700;z-index:3;border-color:#4ade80;box-shadow:0 0 12px rgba(74,222,128,.28);">↔</button>
+<div id="tracker-collapsed-drag-handle" aria-label="Drag minimized floating tracker" title="Drag floating tracker">•••</div>
+<div id="tracker-notice"></div>
+<div id="tracker-break-panel">
+    <div id="break-focus-label" style="text-align:center;color:var(--tracker-warning);font:700 11px Segoe UI,sans-serif;">BREAK TIME REMAINING</div>
+    <div id="break-countdown" style="margin:5px 0 9px;text-align:center;color:var(--tracker-text);font:700 24px monospace;letter-spacing:1px;">30:00</div>
+    <button type="button" class="tracker-button" id="break-focus-resume" data-tracker-action="break-toggle">Resume</button>
+    <div style="height:7px;"></div>
+    <div class="tracker-grid">
+        <button type="button" class="tracker-button" data-tracker-action="dock-left">Dock Left</button>
+        <button type="button" class="tracker-button" data-tracker-action="dock-right">Dock Right</button>
+    </div>
+</div>
+<div id="tracker-floating-summary">
+    <div class="tracker-floating-essential">
+        <div class="floating-compact-label">TRINOVATION TRACKER</div>
+        <div class="floating-compact-hide" style="text-align:center;margin-bottom:5px;"><span id="floating-mode">MODE NOT SET</span></div>
+        <div class="tracker-row"><span id="floating-status" style="color:#facc15;font-weight:700;">WAITING</span><strong id="floating-task">N/A</strong></div>
+        <div class="tracker-row floating-compact-hide"><span>Job</span><strong id="floating-job" style="color:var(--tracker-warning);max-width:145px;overflow:hidden;text-overflow:ellipsis;">None</strong></div>
+        <div class="tracker-row"><span>Interval</span><strong id="floating-interval">1ST</strong></div>
+        <div class="tracker-timing-strip" title="Combined time for Confirmation and Coverage">
+            <div class="tracker-time-chip"><span>Active</span><strong id="floating-total-active">0m 0s</strong></div>
+            <div class="tracker-time-chip"><span>Idle</span><strong id="floating-total-idle">0m 0s</strong></div>
+            <div class="tracker-time-chip"><span id="floating-total-pause-label">Break</span><strong id="floating-total-break">0m 0s</strong></div>
+        </div>
+    </div>
+
+    <div class="floating-primary-actions">
+        <div style="height:6px;"></div>
+        <div class="tracker-grid" id="floating-mode-selector">
+            <button type="button" class="tracker-button" id="floating-mode1-btn" data-tracker-action="mode1">Confirmation</button>
+            <button type="button" class="tracker-button" id="floating-mode2-btn" data-tracker-action="mode2">Coverage</button>
+        </div>
+        <div style="height:5px;"></div>
+        <button type="button" class="tracker-button tracker-primary" id="floating-start-btn" data-tracker-action="start-shift">Select Mode First</button>
+        <div style="height:5px;"></div>
+        <button type="button" class="tracker-button tracker-end-shift" id="floating-end-btn" data-tracker-action="end-shift" style="display:none;">End Shift</button>
+    </div>
+
+    <details class="tracker-dropdown">
+        <summary>COUNTERS</summary>
+        <div class="tracker-dropdown-body">
+            <div class="floating-card" id="floating-mode1-card">
+                <div class="floating-card-title">MODE 1 — CONFIRMATION</div>
+                <div class="tracker-row"><span>Tasks</span><strong id="floating-mode1-tasks">0</strong></div>
+                <div class="tracker-row"><span>Jobs</span><strong id="floating-mode1-jobs">0</strong></div>
+            </div>
+            <div class="floating-card" id="floating-mode2-card">
+                <div class="floating-card-title">MODE 2 — COVERAGE</div>
+                <div class="tracker-row"><span>Tasks</span><strong id="floating-mode2-tasks">0</strong></div>
+                <div class="tracker-row"><span>Jobs</span><strong id="floating-mode2-jobs">0</strong></div>
+                <div class="tracker-row"><span>Empty Confirm</span><strong id="floating-mode2-empty-confirm">0</strong></div>
+                <div class="tracker-row"><span>Empty No Match</span><strong id="floating-mode2-empty-nomatch">0</strong></div>
+                <div class="tracker-row"><span>Unblurred</span><strong id="floating-mode2-unblurred">0</strong></div>
+                <div class="tracker-row"><span>Deleted Boxes</span><strong id="floating-mode2-deleted">0</strong></div>
+                <div class="tracker-row"><span>Skipped</span><strong id="floating-mode2-skipped">0</strong></div>
+            </div>
+        </div>
+    </details>
+
+    <details class="tracker-dropdown">
+        <summary>PAUSE CONTROLS</summary>
+        <div class="tracker-dropdown-body">
+            <div style="height:6px;"></div>
+            <div class="tracker-grid">
+                <button type="button" class="tracker-button" id="floating-bio-btn" data-tracker-action="bio">BIO 15m</button>
+                <button type="button" class="tracker-button" id="floating-hbio-btn" data-tracker-action="hbio">HBIO 10m</button>
+            </div>
+            <div id="floating-bio-row" class="tracker-row" style="display:none;margin-top:5px;"><span>BIO Remaining</span><strong id="floating-bio-status">S1/1 15:00</strong></div>
+            <div id="floating-hbio-row" class="tracker-row" style="display:none;margin-top:5px;"><span>HBIO Remaining</span><strong id="floating-hbio-status">S1/1 10:00</strong></div>
+            <div style="height:5px;"></div>
+            <button type="button" class="tracker-button" id="floating-break-toggle" data-tracker-action="break-toggle" style="display:none;">Break</button>
+            <button type="button" class="tracker-button" id="floating-lunch-toggle" data-tracker-action="lunch-toggle" style="display:none;">Lunch Break</button>
+        </div>
+    </details>
+
+    <details class="tracker-dropdown">
+        <summary>LAYOUT</summary>
+        <div class="tracker-dropdown-body">
+            <div style="height:6px;"></div>
+            <div class="tracker-grid">
+                <button type="button" class="tracker-button" data-tracker-action="dock-left">Dock Left</button>
+                <button type="button" class="tracker-button" data-tracker-action="dock-right">Dock Right</button>
+            </div>
+        </div>
+    </details>
+</div>
+<div id="tracker-content" style="padding:9px;font-family:monospace;overflow-y:auto;height:calc(100vh - 42px);">
+    <div class="tracker-row"><span>PH Time</span><strong id="clock">--:--:--</strong></div>
+    <div class="tracker-row"><span>Status</span><strong id="status" style="color:#facc15">WAITING</strong></div>
+    <div class="tracker-row"><span>Current Interval</span><strong id="interval">1ST</strong></div>
+    <div class="tracker-timing-strip" title="Combined time for Confirmation and Coverage">
+        <div class="tracker-time-chip"><span>Active</span><strong id="tracker-total-active">0m 0s</strong></div>
+        <div class="tracker-time-chip"><span>Idle</span><strong id="tracker-total-idle">0m 0s</strong></div>
+        <div class="tracker-time-chip"><span id="tracker-total-pause-label">Break</span><strong id="tracker-total-break">0m 0s</strong></div>
+    </div>
+
+    <div id="mode-mismatch-warning" style="display:none;margin-top:8px;padding:8px;border:1px solid #f59e0b;border-radius:6px;background:#451a03;color:#fde68a;">
+        <div style="font-weight:700;margin-bottom:4px;">⚠ MODE MISMATCH</div>
+        <div id="mode-mismatch-text" style="font-size:11px;margin-bottom:6px;"></div>
+        <div class="tracker-grid">
+            <button type="button" class="tracker-button" data-tracker-action="mode2">Switch to Coverage</button>
+            <button type="button" class="tracker-button" data-tracker-action="bypass-mismatch">Continue 1 Task Untracked</button>
+        </div>
+    </div>
+
+    <details class="tracker-dropdown" open>
+        <summary>WORK DETAILS</summary>
+        <div class="tracker-dropdown-body">
+            <div class="tracker-section">
+                <div class="tracker-section-title" id="mode1-section-title">MODE 1 — CONFIRMATION</div>
+                <div class="tracker-row"><span>Tasks</span><strong id="mode1-tasks">${stats.totalTaskCompleted || 0}</strong></div>
+                <div class="tracker-row"><span>Jobs</span><strong id="mode1-jobs">${stats.totalJobsCompleted || 0}</strong></div>
+            </div>
+            <div class="tracker-section">
+                <div class="tracker-section-title" id="mode2-section-title">MODE 2 — COVERAGE</div>
+                <div class="tracker-row"><span>Tasks</span><strong id="mode2-tasks">0</strong></div>
+                <div class="tracker-row"><span>Jobs</span><strong id="mode2-jobs">0</strong></div>
+                <div class="tracker-row"><span>Empty Confirm</span><strong id="mode2-empty-confirm">0</strong></div>
+                <div class="tracker-row"><span>Empty No Match</span><strong id="mode2-empty-nomatch">0</strong></div>
+                <div class="tracker-row"><span>Unblurred Person</span><strong id="mode2-unblurred">0</strong></div>
+                <div class="tracker-row"><span>Deleted Boxes</span><strong id="mode2-deleted">0</strong></div>
+                <div class="tracker-row"><span>Skipped Task</span><strong id="mode2-skipped">0</strong></div>
+            </div>
+            <div class="tracker-section">
+                <div class="tracker-row"><span>Current Job</span><strong id="job" style="color:var(--tracker-warning);max-width:135px;overflow:hidden;text-overflow:ellipsis;">${stats.currentJobId || getJobId()}</strong></div>
+                <div class="tracker-row"><span>Task Number</span><strong id="task-number" style="color:#38bdf8;max-width:135px;overflow:hidden;text-overflow:ellipsis;">N/A</strong></div>
+            </div>
+        </div>
+    </details>
+
+    <details class="tracker-dropdown">
+        <summary>WORK CONTROLS</summary>
+        <div class="tracker-dropdown-body">
+            <div style="height:6px;"></div>
+            <div class="tracker-grid">
+                <button type="button" class="tracker-button" id="tracker-mode1-btn" data-tracker-action="mode1">Confirmation</button>
+                <button type="button" class="tracker-button" id="tracker-mode2-btn" data-tracker-action="mode2">Coverage</button>
+            </div>
+            <div style="height:5px;"></div>
+            <button type="button" class="tracker-button tracker-primary" id="tracker-start-btn" data-tracker-action="start-shift">Select Mode First</button>
+            <div style="height:5px;"></div>
+            <button type="button" class="tracker-button tracker-end-shift" id="tracker-end-btn" data-tracker-action="end-shift" style="display:none;">End Shift</button>
+            <div style="height:5px;"></div>
+            <div class="tracker-grid">
+                <button type="button" class="tracker-button" id="tracker-bio-btn" data-tracker-action="bio">BIO 15m</button>
+                <button type="button" class="tracker-button" id="tracker-hbio-btn" data-tracker-action="hbio">HBIO 10m</button>
+            </div>
+            <div style="height:5px;"></div>
+            <div class="tracker-row"><span>BIO</span><strong id="bio-session-status">S1/1 15:00</strong></div>
+            <div class="tracker-row"><span>HBIO</span><strong id="hbio-session-status">S1/1 10:00</strong></div>
+            <div style="height:5px;"></div>
+            <button type="button" class="tracker-button" id="tracker-break-toggle" data-tracker-action="break-toggle" style="display:none;">Break</button>
+            <button type="button" class="tracker-button" id="tracker-lunch-toggle" data-tracker-action="lunch-toggle" style="display:none;">Lunch Break</button>
+            <div style="height:5px;"></div>
+            <button type="button" class="tracker-button" data-tracker-action="reset">Reset Interval</button>
+        </div>
+    </details>
+
+    <details class="tracker-dropdown">
+        <summary>REPORT & LAYOUT</summary>
+        <div class="tracker-dropdown-body">
+            <div style="height:6px;"></div>
+            <button type="button" class="tracker-button tracker-primary" data-tracker-action="report">Generate Report & Send to Drive</button>
+            <div id="tracker-report-status" style="margin-top:5px;color:var(--tracker-muted);font-size:9px;line-height:1.35;">Last report: none</div>
+            <input type="file" id="tracker-tamper-file" style="display:none;">
+            <div style="height:7px;"></div>
+            <div class="tracker-grid">
+                <button type="button" class="tracker-button" data-tracker-action="dock-left">Dock Left</button>
+                <button type="button" class="tracker-button" data-tracker-action="dock-right">Dock Right</button>
+            </div>
+            <div style="height:5px;"></div>
+            <button type="button" class="tracker-button" data-tracker-action="floating">Floating Window</button>
+        </div>
+    </details>
+    <div id="log" style="margin-top:8px;color:var(--tracker-muted);font-size:10px;min-height:14px;">Connecting...</div>
+</div>
+<div id="tracker-settings-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <strong>TRACKER SETTINGS</strong>
+        <button type="button" class="tracker-button" data-tracker-action="settings-close" style="width:34px;">×</button>
+    </div>
+    <label class="tracker-label" for="tracker-ui-color">UI Color</label>
+    <div style="display:grid;grid-template-columns:52px 1fr;gap:7px;align-items:center;">
+        <input id="tracker-ui-color" class="tracker-field" type="color" value="#18181b" style="height:36px;padding:3px;cursor:pointer;">
+        <input id="tracker-ui-color-value" class="tracker-field" type="text" value="#18181b" maxlength="7" placeholder="#18181b">
+    </div>
+    <div style="margin-top:5px;color:var(--tracker-muted);font-size:9px;line-height:1.35;">Choose any UI color. Text and counter contrast adjust automatically.</div>
+    <label class="tracker-label" for="tracker-agent-lastname">Agent last name</label>
+    <input id="tracker-agent-lastname" class="tracker-field" type="text" maxlength="80" placeholder="Example: Ballados">
+    <details class="tracker-dropdown tracker-settings-dropdown">
+        <summary>FIRST-TIME / DEVICE SETUP</summary>
+        <div class="tracker-dropdown-body">
+        <div style="margin:4px 0 7px;color:var(--tracker-muted);font-size:9px;line-height:1.4;">Complete this once per device. Last name controls the daily report filename, while Pod controls the exact Google Drive destination folder.</div>
+        <label class="tracker-label" for="tracker-upload-endpoint">Apps Script Web App /exec URL</label>
+        <input id="tracker-upload-endpoint" class="tracker-field" type="text" autocomplete="off" placeholder="https://script.google.com/.../exec">
+
+        <label class="tracker-label" for="tracker-upload-token">Registration token</label>
+        <input id="tracker-upload-token" class="tracker-field" type="password" autocomplete="new-password" placeholder="Required for first setup / credential rotation">
+
+        <label class="tracker-label" for="tracker-upload-agent-id">Agent ID</label>
+        <input id="tracker-upload-agent-id" class="tracker-field" type="text" maxlength="64" autocomplete="off" placeholder="POD-10-0001">
+
+        <label class="tracker-label" for="tracker-upload-agent-name">Agent name</label>
+        <input id="tracker-upload-agent-name" class="tracker-field" type="text" maxlength="120" autocomplete="off" placeholder="Agent full name">
+
+        <label class="tracker-label" for="tracker-upload-department">Department</label>
+        <select id="tracker-upload-department" class="tracker-field">
+            <option value="OOS">OOS</option>
+            <option value="ENCORD">ENCORD</option>
+        </select>
+
+        <label class="tracker-label" for="tracker-upload-pod">Pod</label>
+        <input id="tracker-upload-pod" class="tracker-field" type="text" maxlength="24" autocomplete="off" placeholder="Pod 10">
+
+        <div id="tracker-upload-state" style="margin:7px 0;color:var(--tracker-muted);font-size:10px;">Controller upload setup not loaded</div>
+        <div id="tracker-device-id" style="margin:4px 0 4px;color:var(--tracker-muted);font-size:9px;word-break:break-all;">Device: not registered</div>
+        <div id="tracker-report-file-example" style="margin:4px 0 7px;color:var(--tracker-muted);font-size:9px;word-break:break-all;">Report file: not configured</div>
+        <button type="button" class="tracker-button" data-tracker-action="upload-settings-save">Complete / Update First-Time Setup</button>
+        <div style="margin-top:5px;color:var(--tracker-muted);font-size:9px;line-height:1.35;">v0.1.21-r2 binds this device to Agent ID + Agent Name + Last Name + Department + Pod. Existing CWH installations are migrated to OOS for backward compatibility. The registration token is used only for first registration or identity changes and is never stored by Tampermonkey.</div>
+        </div>
+    </details>
+
+    <div style="height:8px;"></div>
+    <button type="button" class="tracker-button tracker-primary" data-tracker-action="settings-save">Save Tracker Settings</button>
+
+    <details class="tracker-dropdown tracker-settings-dropdown">
+        <summary>TRACKER DATA</summary>
+        <div class="tracker-dropdown-body">
+        <div style="margin:4px 0 7px;color:var(--tracker-muted);font-size:9px;line-height:1.4;">Reset All clears today's Confirmation/Coverage counters, Active/Idle timing, Break, BIO/HBIO usage, jobs, and interval history. It does not remove generated report files, Google Drive setup, or this device credential.</div>
+        <button type="button" class="tracker-button" id="tracker-settings-reset-all-btn" data-tracker-action="reset-all" style="border-color:var(--tracker-danger) !important;color:var(--tracker-danger) !important;font-weight:700;">Reset All Tracker Data</button>
+        </div>
+    </details>
+
+    <details class="tracker-dropdown tracker-settings-dropdown">
+        <summary>SYSTEM STATUS</summary>
+        <div class="tracker-dropdown-body">
+        <div id="tracker-runtime-status" style="font-size:9px;line-height:1.45;color:var(--tracker-muted);">Controller: checking...</div>
+        <button type="button" class="tracker-button" data-tracker-action="retry-controller" style="margin-top:6px;">Retry Controller Connection</button>
+        <button type="button" class="tracker-button" data-tracker-action="check-updates" style="margin-top:6px;">Check for Updates</button>
+        <button type="button" class="tracker-button tracker-primary" id="tracker-install-release-btn" data-tracker-action="install-release" style="margin-top:6px;">Check & Install Auto Tracker Update</button>
+        <button type="button" class="tracker-button" id="tracker-restart-controller-btn" data-tracker-action="restart-controller" style="margin-top:6px;display:none;">Restart Controller to Finish</button>
+        <div id="tracker-update-install-status" style="margin-top:6px;font-size:9px;line-height:1.4;color:var(--tracker-muted);">Update install: not started</div>
+        <button type="button" class="tracker-button" data-tracker-action="view-errors" style="margin-top:6px;">View Recent Errors</button>
+        <button type="button" class="tracker-button" data-tracker-action="export-diagnostics" style="margin-top:6px;">Export Diagnostic Log</button>
+        <div id="tracker-error-summary" style="margin-top:6px;font-size:9px;line-height:1.4;color:var(--tracker-muted);"></div>
+        </div>
+    </details>
+    <details class="tracker-dropdown tracker-settings-dropdown">
+        <summary>PRIVACY & USE</summary>
+        <div class="tracker-dropdown-body">
+        <div style="font-size:9px;line-height:1.4;color:var(--tracker-muted);">Auto Tracker records work-related task/job counts, shift timing, pause timing, device registration metadata and diagnostic errors. It does not need passwords or registration/device tokens in diagnostic logs. Open the notice for the current v0.1.21-r2 disclosure.</div>
+        <button type="button" class="tracker-button" data-tracker-action="privacy-notice" style="margin-top:6px;">View Privacy Notice</button>
+        </div>
+    </details>
+    <div style="height:8px;"></div>
+    <button type="button" class="tracker-button" id="tracker-settings-update-btn" data-tracker-action="tampermonkey-update">Advanced: Update Tampermonkey Only</button>
+    <div style="height:6px;"></div>
+    <div style="color:var(--tracker-muted);font-size:9px;line-height:1.4;">Settings are available only while docked left or right. Google Drive authorization and upload credentials stay in the local controller configuration.</div>
+</div>
+`;
+    Object.assign(overlay.style, {
+        position: 'fixed',
+        top: '0',
+        bottom: '0',
+        width: TRACKER_DOCK_WIDTH + 'px',
+        height: '100vh',
+        background: '#18181b',
+        color: '#fff',
+        border: '1px solid #333',
+        fontFamily: 'Segoe UI',
+        fontSize: '12px',
+        zIndex: 999999,
+        boxShadow: '0 0 12px rgba(0,0,0,.35)',
+        overflow: 'hidden'
+    });
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', handleTrackerControlClick);
+    applyTrackerColor(trackerUiColor);
+    populateTrackerSettings();
+    if ($('tracker-ui-color')) {
+        $('tracker-ui-color').addEventListener('input', event => {
+            const value = normalizeTrackerColor(event.target.value);
+            if ($('tracker-ui-color-value')) $('tracker-ui-color-value').value = value;
+            applyTrackerColor(value);
+        });
+    }
+    if ($('tracker-ui-color-value')) {
+        $('tracker-ui-color-value').addEventListener('change', event => {
+            const value = normalizeTrackerColor(event.target.value);
+            event.target.value = value;
+            if ($('tracker-ui-color')) $('tracker-ui-color').value = value;
+            applyTrackerColor(value);
+        });
+    }
+    if ($('tracker-tamper-file')) $('tracker-tamper-file').addEventListener('change', handleTampermonkeyUpdateFile);
+    for (const fieldId of [
+        'tracker-agent-lastname',
+        'tracker-upload-endpoint',
+        'tracker-upload-token',
+        'tracker-upload-agent-id',
+        'tracker-upload-agent-name',
+        'tracker-upload-department',
+        'tracker-upload-pod'
+    ]) {
+        $(fieldId)?.addEventListener('input', () => {
+            reportUploadSettingsDraftDirty = true;
+        });
+    }
+    makeDraggable(overlay, $('tracker-dock-header'), $('tracker-collapsed-drag-handle'));
+    applyDockLayout();
+    renderActiveModeTitle();
+    renderShiftStartControl();
+    updateBreakControl();
+    renderSpecialSessionControls();
+    renderLiveModeTiming();
+    renderControllerIdentity();
+    renderShiftWall();
+
+}
+
+// =========================================
+// FUNCTION GET TOOL ROOT
+// Search: getToolRoot
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function getToolRoot() {
+
+    const selectors = ['#root', '#app', '[data-reactroot]'];
+    for (const selector of selectors) {
+        const candidate = document.querySelector(selector);
+        if (candidate && candidate.id !== 'tracker-overlay' && !candidate.closest('#tracker-overlay')) return candidate;
+    }
+    return null;
+
+}
+
+// =========================================
+// FUNCTION APPLY DOCK LAYOUT
+// Search: applyDockLayout
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Dropdown_Compact_Floating
+// =========================================
+function applyDockLayout() {
+
+    const overlay = $('tracker-overlay');
+    if (!overlay) return;
+    const root = getToolRoot();
+    const floating = trackerLayoutMode === 'floating';
+    if (floating) overlay.classList.remove('tracker-settings-open');
+    overlay.classList.toggle('tracker-floating', floating);
+    overlay.classList.toggle('tracker-collapsed', trackerCollapsed);
+
+    if ($('tracker-collapse-btn')) {
+        $('tracker-collapse-btn').textContent = '−';
+        $('tracker-collapse-btn').title = 'Minimize tracker';
+    }
+    if ($('tracker-expand-middle')) {
+        $('tracker-expand-middle').textContent = floating ? '+' : (trackerLayoutMode === 'left' ? '▶' : '◀');
+        $('tracker-expand-middle').title = floating ? 'Expand tracker' : 'Maximize tracker';
+    }
+
+    if (floating) {
+        const floatingWidth = trackerCollapsed ? TRACKER_FLOAT_COMPACT_WIDTH : TRACKER_FLOAT_WIDTH;
+        const floatingHeight = trackerCollapsed ? TRACKER_FLOAT_COMPACT_HEIGHT : 'auto';
+        const maxLeft = Math.max(0, window.innerWidth - floatingWidth - 6);
+        const maxTop = Math.max(0, window.innerHeight - (trackerCollapsed ? TRACKER_FLOAT_COMPACT_HEIGHT : 260));
+        trackerFloatLeft = Math.min(Math.max(6, trackerFloatLeft), maxLeft);
+        trackerFloatTop = Math.min(Math.max(6, trackerFloatTop), maxTop);
+        overlay.style.width = floatingWidth + 'px';
+        overlay.style.height = typeof floatingHeight === 'number' ? floatingHeight + 'px' : floatingHeight;
+        overlay.style.maxHeight = trackerCollapsed ? TRACKER_FLOAT_COMPACT_HEIGHT + 'px' : 'calc(100vh - 12px)';
+        overlay.style.left = trackerFloatLeft + 'px';
+        overlay.style.top = trackerFloatTop + 'px';
+        overlay.style.right = 'auto';
+        overlay.style.bottom = 'auto';
+        overlay.style.borderRadius = trackerCollapsed ? '12px' : '14px';
+        overlay.style.overflow = 'hidden';
+        if ($('tracker-layout-label')) $('tracker-layout-label').textContent = 'FLOAT';
+        if (root) {
+            root.style.removeProperty('width');
+            root.style.removeProperty('max-width');
+            root.style.removeProperty('margin-left');
+            root.style.removeProperty('margin-right');
+        }
+        document.body.style.removeProperty('padding-left');
+        document.body.style.removeProperty('padding-right');
+    } else {
+        const side = trackerLayoutMode === 'left' ? 'left' : 'right';
+        const width = trackerCollapsed ? TRACKER_COLLAPSED_WIDTH : TRACKER_DOCK_WIDTH;
+        GM_setValue('trackerDockSide', side);
+        overlay.style.width = width + 'px';
+        overlay.style.height = '100vh';
+        overlay.style.maxHeight = 'none';
+        overlay.style.top = '0';
+        overlay.style.bottom = '0';
+        overlay.style.left = side === 'left' ? '0' : 'auto';
+        overlay.style.right = side === 'right' ? '0' : 'auto';
+        overlay.style.borderRadius = '0';
+        if ($('tracker-layout-label')) $('tracker-layout-label').textContent = side === 'left' ? 'LEFT' : 'RIGHT';
+        if (root) {
+            root.style.setProperty('box-sizing', 'border-box', 'important');
+            root.style.setProperty('width', `calc(100vw - ${width}px)`, 'important');
+            root.style.setProperty('max-width', `calc(100vw - ${width}px)`, 'important');
+            root.style.setProperty('margin-left', side === 'left' ? width + 'px' : '0px', 'important');
+            root.style.setProperty('margin-right', side === 'right' ? width + 'px' : '0px', 'important');
+        } else {
+            document.body.style.setProperty('box-sizing', 'border-box', 'important');
+            document.body.style.setProperty('padding-left', side === 'left' ? width + 'px' : '0px', 'important');
+            document.body.style.setProperty('padding-right', side === 'right' ? width + 'px' : '0px', 'important');
+        }
+    }
+
+}
+
+// =========================================
+// FUNCTION SET TRACKER LAYOUT
+// Search: setTrackerLayout
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// =========================================
+function setTrackerLayout(mode) {
+
+    if (!['left', 'right', 'floating'].includes(mode)) return;
+    trackerLayoutMode = mode;
+    if (mode === 'floating') {
+        trackerCollapsed = false;
+        const overlay = $('tracker-overlay');
+        if (overlay) overlay.classList.remove('tracker-settings-open');
+    }
+    GM_setValue('trackerLayoutMode', trackerLayoutMode);
+    GM_setValue('trackerCollapsed', trackerCollapsed);
+    applyDockLayout();
+
+}
+
+// =========================================
+// FUNCTION SET TRACKER COLLAPSED
+// Search: setTrackerCollapsed
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// =========================================
+function setTrackerCollapsed(collapsed) {
+
+    trackerCollapsed = Boolean(collapsed);
+    GM_setValue('trackerCollapsed', trackerCollapsed);
+    applyDockLayout();
+
+}
+
+// =========================================
+// FUNCTION NORMALIZE TRACKER COLOR
+// Search: normalizeTrackerColor
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function normalizeTrackerColor(value) {
+
+    const color = String(value || '').trim();
+    return /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : '#18181b';
+
+}
+
+// =========================================
+// FUNCTION MIX TRACKER COLOR
+// Search: mixTrackerColor
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function mixTrackerColor(hex, targetHex, amount) {
+
+    const parse = value => [
+        parseInt(value.slice(1, 3), 16),
+        parseInt(value.slice(3, 5), 16),
+        parseInt(value.slice(5, 7), 16)
+    ];
+    const source = parse(normalizeTrackerColor(hex));
+    const target = parse(normalizeTrackerColor(targetHex));
+    const ratio = Math.max(0, Math.min(1, Number(amount || 0)));
+    const mixed = source.map((channel, index) => Math.round(channel + (target[index] - channel) * ratio));
+    return '#' + mixed.map(value => value.toString(16).padStart(2, '0')).join('');
+
+}
+
+// =========================================
+// FUNCTION TRACKER RELATIVE LUMINANCE
+// Search: trackerRelativeLuminance
+// Ver 0.1.14 Alpha || 2026-09-27 || JBallados || Adaptive_Contrast
+// =========================================
+function trackerRelativeLuminance(hex) {
+
+    const color = normalizeTrackerColor(hex);
+    const channels = [
+        parseInt(color.slice(1, 3), 16),
+        parseInt(color.slice(3, 5), 16),
+        parseInt(color.slice(5, 7), 16)
+    ].map(value => {
+        const channel = value / 255;
+        return channel <= 0.04045
+            ? channel / 12.92
+            : Math.pow((channel + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+
+}
+
+// =========================================
+// FUNCTION TRACKER CONTRAST RATIO
+// Search: trackerContrastRatio
+// Ver 0.1.14 Alpha || 2026-09-27 || JBallados || Adaptive_Contrast
+// =========================================
+function trackerContrastRatio(first, second) {
+
+    const a = trackerRelativeLuminance(first);
+    const b = trackerRelativeLuminance(second);
+    const lighter = Math.max(a, b);
+    const darker = Math.min(a, b);
+    return (lighter + 0.05) / (darker + 0.05);
+
+}
+
+// =========================================
+// FUNCTION TRACKER BEST TEXT COLOR
+// Search: trackerBestTextColor
+// Ver 0.1.14 Alpha || 2026-09-27 || JBallados || Adaptive_Contrast
+// =========================================
+function trackerBestTextColor(background) {
+
+    const darkText = '#0b1220';
+    const brightText = '#f8fafc';
+    return trackerContrastRatio(background, brightText) >= trackerContrastRatio(background, darkText)
+        ? brightText
+        : darkText;
+
+}
+
+// =========================================
+// FUNCTION TRACKER BEST SEMANTIC COLOR
+// Search: trackerBestSemanticColor
+// Ver 0.1.14 Alpha || 2026-09-27 || JBallados || Adaptive_Contrast
+// =========================================
+function trackerBestSemanticColor(background, candidates) {
+
+    const safeCandidates = Array.isArray(candidates) ? candidates : [];
+    let bestSemantic = null;
+    let bestSemanticRatio = 0;
+    for (const candidate of safeCandidates) {
+        const normalized = normalizeTrackerColor(candidate);
+        const ratio = trackerContrastRatio(background, normalized);
+        if (ratio > bestSemanticRatio) {
+            bestSemantic = normalized;
+            bestSemanticRatio = ratio;
+        }
+    }
+    return bestSemantic && bestSemanticRatio >= 4.5
+        ? bestSemantic
+        : trackerBestTextColor(background);
+
+}
+
+// =========================================
+// FUNCTION TRACKER COLOR IS LIGHT
+// Search: trackerColorIsLight
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.14 Alpha || 2026-09-27 || JBallados || Adaptive_Contrast
+// =========================================
+function trackerColorIsLight(hex) {
+
+    return trackerBestTextColor(hex) === '#0b1220';
+
+}
+
+// =========================================
+// FUNCTION APPLY TRACKER COLOR
+// Search: applyTrackerColor
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.14 Alpha || 2026-09-27 || JBallados || Adaptive_Contrast
+// =========================================
+function applyTrackerColor(color = trackerUiColor) {
+
+    trackerUiColor = normalizeTrackerColor(color);
+    GM_setValue('trackerUiColor', trackerUiColor);
+
+    const text = trackerBestTextColor(trackerUiColor);
+    const toward = text;
+    const surface = mixTrackerColor(trackerUiColor, toward, 0.08);
+    const surface2 = mixTrackerColor(trackerUiColor, toward, 0.045);
+    const header = mixTrackerColor(trackerUiColor, toward, 0.12);
+    const border = mixTrackerColor(trackerUiColor, toward, 0.28);
+    const muted = mixTrackerColor(text, trackerUiColor, 0.24);
+    const success = trackerBestSemanticColor(trackerUiColor, ['#4ade80', '#166534', '#14532d']);
+    const warning = trackerBestSemanticColor(trackerUiColor, ['#facc15', '#92400e', '#78350f']);
+    const danger = trackerBestSemanticColor(trackerUiColor, ['#f87171', '#991b1b', '#7f1d1d']);
+
+    const overlay = $('tracker-overlay');
+    if (overlay) {
+        overlay.style.setProperty('--tracker-bg', trackerUiColor);
+        overlay.style.setProperty('--tracker-surface', surface);
+        overlay.style.setProperty('--tracker-surface-2', surface2);
+        overlay.style.setProperty('--tracker-border', border);
+        overlay.style.setProperty('--tracker-header', header);
+        overlay.style.setProperty('--tracker-text', text);
+        overlay.style.setProperty('--tracker-muted', muted);
+        overlay.style.setProperty('--tracker-success', success);
+        overlay.style.setProperty('--tracker-warning', warning);
+        overlay.style.setProperty('--tracker-danger', danger);
+        overlay.style.background = trackerUiColor;
+        overlay.style.color = text;
+        overlay.style.borderColor = border;
+        overlay.dataset.textTone = text === '#f8fafc' ? 'bright' : 'dark';
+        overlay.classList.toggle('tracker-light', text === '#0b1220');
+        overlay.querySelectorAll('.tracker-row span, .tracker-row strong, .tracker-subsection-title, .floating-card-title').forEach(element => {
+            if (!element.style.color || ['rgb(255, 255, 255)', '#fff', '#ffffff'].includes(String(element.style.color).toLowerCase())) {
+                element.style.color = 'var(--tracker-text)';
+            }
+        });
+    }
+
+    if ($('tracker-ui-color')) $('tracker-ui-color').value = trackerUiColor;
+    if ($('tracker-ui-color-value')) $('tracker-ui-color-value').value = trackerUiColor;
+
+}
+
+// =========================================
+// FUNCTION POPULATE TRACKER SETTINGS
+// Search: populateTrackerSettings
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.16 Alpha || 2026-09-28 || JBallados || First_Time_Setup
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Preserve_First_Time_Draft
+// =========================================
+function populateTrackerSettings(options = {}) {
+
+    const preserveUploadDraft = options.preserveUploadDraft === true || reportUploadSettingsDraftDirty;
+    const serverLastName = String(reportSettingsState?.lastName || '').trim();
+    if (serverLastName) {
+        trackerAgentLastName = serverLastName;
+        GM_setValue('trackerAgentLastName', trackerAgentLastName);
+    }
+    if ($('tracker-ui-color')) $('tracker-ui-color').value = normalizeTrackerColor(trackerUiColor);
+    if ($('tracker-ui-color-value')) $('tracker-ui-color-value').value = normalizeTrackerColor(trackerUiColor);
+    if (!preserveUploadDraft) {
+        if ($('tracker-agent-lastname')) $('tracker-agent-lastname').value = trackerAgentLastName;
+        if ($('tracker-upload-endpoint')) $('tracker-upload-endpoint').value = reportUploadSettingsState.endpoint || '';
+        if ($('tracker-upload-agent-id')) $('tracker-upload-agent-id').value = reportUploadSettingsState.agentId || '';
+        if ($('tracker-upload-agent-name')) $('tracker-upload-agent-name').value = reportUploadSettingsState.agentName || '';
+        if ($('tracker-upload-department')) {
+            const savedDepartment = String(reportUploadSettingsState.department || 'OOS').trim().toUpperCase();
+            $('tracker-upload-department').value = savedDepartment === 'CWH' ? 'OOS' : savedDepartment;
+        }
+        if ($('tracker-upload-pod')) $('tracker-upload-pod').value = reportUploadSettingsState.pod || '';
+        if ($('tracker-upload-token')) $('tracker-upload-token').value = '';
+    }
+    if ($('tracker-upload-token')) {
+        $('tracker-upload-token').placeholder = reportUploadSettingsState.deviceRegistered
+            ? 'Leave blank to keep this device credential'
+            : 'Enter registration token';
+    }
+    if ($('tracker-upload-state')) {
+        $('tracker-upload-state').textContent = reportUploadSettingsState.setupComplete
+            ? 'Setup complete • ' + (reportUploadSettingsState.lastName || trackerAgentLastName || 'Agent') + ' • ' + (String(reportUploadSettingsState.department || 'OOS').toUpperCase() === 'CWH' ? 'OOS' : (reportUploadSettingsState.department || 'OOS')) + ' • ' + (reportUploadSettingsState.pod || 'Pod')
+            : reportUploadSettingsState.deviceRegistered
+                ? 'Device registered, but first-time identity setup is incomplete'
+                : 'First-time device setup not completed';
+        $('tracker-upload-state').style.color = reportUploadSettingsState.setupComplete ? 'var(--tracker-success)' : 'var(--tracker-warning)';
+    }
+    if ($('tracker-device-id')) {
+        $('tracker-device-id').textContent = reportUploadSettingsState.deviceId
+            ? 'Device: ' + reportUploadSettingsState.deviceId
+            : 'Device: not registered';
+    }
+    if ($('tracker-report-file-example')) {
+        const example = reportUploadSettingsState.reportFileExample
+            || reportSettingsState?.reportFileExample
+            || (trackerAgentLastName ? trackerAgentLastName + '_YYYY-MM-DD_' + (String(reportUploadSettingsState.department || 'OOS').toUpperCase() === 'CWH' ? 'OOS' : String(reportUploadSettingsState.department || 'OOS').toUpperCase()) + '.xlsx' : '');
+        $('tracker-report-file-example').textContent = example
+            ? 'Report file: ' + example
+            : 'Report file: set Agent last name to preview';
+    }
+}
+
+// =========================================
+// FUNCTION SET TRACKER SETTINGS OPEN
+// Search: setTrackerSettingsOpen
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Settings_Draft_Baseline
+// =========================================
+function setTrackerSettingsOpen(open) {
+
+    const overlay = $('tracker-overlay');
+    if (!overlay) return;
+    if (open && trackerLayoutMode === 'floating') {
+        showTrackerNotice('Dock the tracker left or right to open Settings.', 7000);
+        overlay.classList.remove('tracker-settings-open');
+        return;
+    }
+    if (open) {
+        trackerCollapsed = false;
+        GM_setValue('trackerCollapsed', false);
+        reportUploadSettingsDraftDirty = false;
+        populateTrackerSettings();
+        loadReportUploadSettingsFromController();
+    }
+    overlay.classList.toggle('tracker-settings-open', Boolean(open));
+    applyDockLayout();
+
+}
+
+// =========================================
+// FUNCTION SAVE TRACKER SETTINGS
+// Search: saveTrackerSettings
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Preserve_Upload_Draft
+// =========================================
+function saveTrackerSettings() {
+
+    const lastName = String($('tracker-agent-lastname')?.value || '').trim();
+    const uiColor = normalizeTrackerColor($('tracker-ui-color-value')?.value || $('tracker-ui-color')?.value || trackerUiColor);
+    if (!lastName) {
+        showTrackerNotice('Enter the agent last name before saving settings.', 9000);
+        return;
+    }
+    trackerAgentLastName = lastName;
+    GM_setValue('trackerAgentLastName', trackerAgentLastName);
+    applyTrackerColor(uiColor);
+    api('POST', '/', {
+        action: 'configure_report_settings',
+        lastName
+    }, data => {
+        if (!data || data.error || data.success === false) {
+            showTrackerNotice('Tracker settings could not be saved to the controller.', 12000);
+            return;
+        }
+        if (data.reportSettings) reportSettingsState = { ...reportSettingsState, ...data.reportSettings };
+        populateTrackerSettings({ preserveUploadDraft: reportUploadSettingsDraftDirty });
+        setTrackerSettingsOpen(false);
+        showTrackerNotice('Tracker settings saved.', 7000);
+    });
+
+}
+
+// =========================================
+// FUNCTION LOAD REPORT UPLOAD SETTINGS FROM CONTROLLER
+// Search: loadReportUploadSettingsFromController
+// Ver 0.1.13 Alpha || 2026-09-27 || JBallados || WebUI_Upload_Settings
+// Ver 0.1.16 Alpha || 2026-09-28 || JBallados || First_Time_Setup
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Preserve_First_Time_Draft
+// =========================================
+function loadReportUploadSettingsFromController() {
+
+    api('POST', '/', { action: 'get_report_upload_settings' }, data => {
+        if (!data || data.success === false || data.error) {
+            if ($('tracker-upload-state')) {
+                $('tracker-upload-state').textContent = 'Controller upload setup unavailable';
+                $('tracker-upload-state').style.color = '#facc15';
+            }
+            return;
+        }
+        if (data.uploadSettings) {
+            reportUploadSettingsState = { ...reportUploadSettingsState, ...data.uploadSettings };
+        }
+        if (data.reportSettings) {
+            reportSettingsState = { ...reportSettingsState, ...data.reportSettings };
+        }
+        if (data.reportSettings?.lastName || data.uploadSettings?.lastName) {
+            trackerAgentLastName = String(data.reportSettings?.lastName || data.uploadSettings?.lastName).trim();
+            GM_setValue('trackerAgentLastName', trackerAgentLastName);
+        }
+        populateTrackerSettings({ preserveUploadDraft: reportUploadSettingsDraftDirty });
+        if (!reportUploadSettingsState.setupComplete && !firstTimeSetupNoticeShown) {
+            firstTimeSetupNoticeShown = true;
+            showTrackerNotice('First-time setup is incomplete. Dock Left/Right, open Settings, then set Last Name, Agent ID, Agent Name, Pod, Apps Script URL, and Registration Token.', 15000);
+        } else if (reportUploadSettingsState.setupComplete) {
+            firstTimeSetupNoticeShown = true;
+        }
+    });
+
+}
+
+// =========================================
+// FUNCTION SAVE REPORT UPLOAD SETTINGS TO CONTROLLER
+// Search: saveReportUploadSettingsToController
+// Ver 0.1.13 Alpha || 2026-09-27 || JBallados || WebUI_Upload_Settings
+// Ver 0.1.16 Alpha || 2026-09-28 || JBallados || First_Time_Setup
+// Ver 0.1.18 Alpha || 2026-09-30 || JBallados || Preserve_First_Time_Draft
+// =========================================
+function saveReportUploadSettingsToController() {
+
+    const endpoint = String($('tracker-upload-endpoint')?.value || '').trim();
+    const registrationToken = String($('tracker-upload-token')?.value || '').trim();
+    const agentId = String($('tracker-upload-agent-id')?.value || '').trim();
+    const agentName = String($('tracker-upload-agent-name')?.value || '').trim();
+    const lastName = String($('tracker-agent-lastname')?.value || trackerAgentLastName || '').trim();
+    const rawDepartment = String($('tracker-upload-department')?.value || 'OOS').trim().toUpperCase();
+    const department = rawDepartment === 'CWH' ? 'OOS' : rawDepartment;
+    const pod = String($('tracker-upload-pod')?.value || '').trim();
+
+    if (!endpoint || !agentId || !agentName || !lastName || !['OOS', 'ENCORD'].includes(department) || !pod) {
+        showTrackerNotice('Complete Apps Script URL, Agent ID, Agent Name, Last Name, Department, and Pod.', 10000);
+        return;
+    }
+    if (!reportUploadSettingsState.deviceRegistered && !registrationToken) {
+        showTrackerNotice('Enter the registration token to register this device.', 10000);
+        return;
+    }
+
+    const applyButton = document.querySelector('[data-tracker-action="upload-settings-save"]');
+    if (applyButton) {
+        applyButton.disabled = true;
+        applyButton.textContent = 'Applying...';
+    }
+
+    api('POST', '/', {
+        action: 'register_report_upload_device',
+        endpoint,
+        registrationToken,
+        agentId,
+        agentName,
+        lastName,
+        department,
+        pod
+    }, data => {
+        if (applyButton) {
+            applyButton.disabled = false;
+            applyButton.textContent = 'Complete / Update First-Time Setup';
+        }
+        if (!data || data.success === false || data.error) {
+            reportUploadSettingsDraftDirty = true;
+            showTrackerNotice(data?.message || 'Controller upload setup could not be saved. Your entered setup values were kept.', 13000);
+            return;
+        }
+        reportUploadSettingsDraftDirty = false;
+        if ($('tracker-upload-token')) $('tracker-upload-token').value = '';
+        if (data.uploadSettings) {
+            reportUploadSettingsState = { ...reportUploadSettingsState, ...data.uploadSettings };
+        }
+        if (data.reportSettings) {
+            reportSettingsState = { ...reportSettingsState, ...data.reportSettings };
+        }
+        populateTrackerSettings();
+        showTrackerNotice(
+            data.status === 'DEVICE_CREDENTIAL_REUSED'
+                ? 'First-time setup updated. Existing device credential was kept.'
+                : 'First-time setup complete. Device is now bound to Department and Pod.',
+            11000
+        );
+    });
+
+}
+// End Modification Ver 0.1.18 Alpha
+
+function getProspectiveShiftPolicy(timestamp = Date.now()) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Asia/Manila',
+        hour: '2-digit',
+        hourCycle: 'h23'
+    }).formatToParts(new Date(timestamp));
+    const hour = Number(parts.find(part => part.type === 'hour')?.value);
+    const dayShift = Number.isFinite(hour) && hour >= 8 && hour <= 11;
+    const rawDepartment = String(
+        $('tracker-upload-department')?.value
+        || reportUploadSettingsState.department
+        || shiftSchedule?.department
+        || 'OOS'
+    ).trim().toUpperCase();
+    const department = rawDepartment === 'CWH' ? 'OOS' : rawDepartment;
+
+    if (department === 'ENCORD') {
+        return {
+            department,
+            dayShift,
+            workMinutes: 480,
+            breakMinutes: 30,
+            lunchMinutes: 60,
+            intervalCount: 2,
+            pauseSummary: '30m Break + 60m Lunch',
+            regularWindowMinutes: 570
+        };
+    }
+
+    const breakMinutes = dayShift ? 0 : 30;
+    const lunchMinutes = dayShift ? 60 : 0;
+    return {
+        department: 'OOS',
+        dayShift,
+        workMinutes: 360,
+        breakMinutes,
+        lunchMinutes,
+        intervalCount: 3,
+        pauseSummary: dayShift ? '60m Lunch' : '30m Break',
+        regularWindowMinutes: 360 + breakMinutes + lunchMinutes
+    };
+}
+
+function formatShiftMinutes(minutes) {
+    const safe = Math.max(0, Number(minutes || 0));
+    const hours = Math.floor(safe / 60);
+    const mins = safe % 60;
+    return hours > 0 ? (hours + 'h' + (mins ? ' ' + mins + 'm' : '')) : (mins + 'm');
+}
+
+function ensureShiftWall() {
+    let wall = $('trinovation-shift-wall');
+    if (wall) return wall;
+    wall = document.createElement('div');
+    wall.id = 'trinovation-shift-wall';
+    wall.innerHTML = `
+        <div class="shift-wall-card">
+            <div class="shift-wall-title">⚠ START SHIFT REQUIRED</div>
+            <div id="shift-wall-status" class="shift-wall-status">Checking Auto Tracker Controller...</div>
+            <div class="shift-wall-grid">
+                <button type="button" id="shift-wall-mode1">Confirmation</button>
+                <button type="button" id="shift-wall-mode2">Coverage</button>
+            </div>
+            <button type="button" class="primary" id="shift-wall-start">START SHIFT</button>
+            <div style="height:8px;"></div>
+            <button type="button" id="shift-wall-retry">Retry Controller Connection</button>
+            <div id="shift-wall-schedule-note" style="margin-top:12px;color:#94a3b8;font-size:11px;">Shift policy uses the selected Department and Manila-time shift start. ENCORD uses 8 work hours with a 30-minute Break and 60-minute Lunch.</div>
+        </div>`;
+    document.body.appendChild(wall);
+    $('shift-wall-mode1')?.addEventListener('click', () => switchTrackingMode(1));
+    $('shift-wall-mode2')?.addEventListener('click', () => switchTrackingMode(2));
+    $('shift-wall-start')?.addEventListener('click', startShiftFromOverlay);
+    $('shift-wall-retry')?.addEventListener('click', () => loadStats());
+    return wall;
+}
+
+function renderShiftWall() {
+    const wall = ensureShiftWall();
+    if (!wall) return;
+    wall.style.display = shiftStarted ? 'none' : 'flex';
+    if (shiftStarted) return;
+    const status = $('shift-wall-status');
+    const start = $('shift-wall-start');
+    const scheduleNote = $('shift-wall-schedule-note');
+    const prospective = getProspectiveShiftPolicy();
+    if (scheduleNote) {
+        scheduleNote.textContent = prospective.department + ' • Expected regular window: ' + formatShiftMinutes(prospective.regularWindowMinutes)
+            + ' • ' + prospective.pauseSummary
+            + ' • ' + prospective.intervalCount + ' regular interval' + (prospective.intervalCount === 1 ? '' : 's')
+            + '. Overtime begins after the regular window.';
+    }
+    if (!controllerConnected) {
+        if (status) status.textContent = 'Controller disconnected. Start Shift cannot be confirmed until the local controller reconnects.';
+        if (start) start.disabled = true;
+        return;
+    }
+    const hasMode = trackingMode === 1 || trackingMode === 2;
+    if (status) status.textContent = hasMode
+        ? 'Auto Tracker is paused. Click START SHIFT before beginning work so Tasks, Jobs, Active/Idle, Break, intervals and Overtime are recorded.'
+        : 'Select Confirmation or Coverage, then click START SHIFT before beginning work.';
+    if (start) start.disabled = !hasMode;
+    $('shift-wall-mode1')?.classList.toggle('active', trackingMode === 1);
+    $('shift-wall-mode2')?.classList.toggle('active', trackingMode === 2);
+}
+
+function showPrivacyNotice() {
+    const accepted = window.confirm(
+        'TRINOVATION AUTO COUNT TRACKER - PRIVACY NOTICE v1.0\n\n'
+        + 'Work data recorded: Agent ID/name/Pod, task and job counts, Start/End Shift, Active/Idle/Break/BIO/HBIO/Overtime timing, report/upload status, device registration identifier, browser/version information, and diagnostic error details.\n\n'
+        + 'Diagnostic logs redact configured secrets such as registration tokens, device tokens, Team Lead tokens, passwords, cookies and authorization values.\n\n'
+        + 'Purpose: operational productivity reporting, report delivery, troubleshooting, update compatibility and Team Lead summaries.\n\n'
+        + 'Reports may be uploaded to the organization Google Drive through the configured Apps Script service. Local generated reports/logs use the configured retention policy.\n\n'
+        + 'Auto Tracker is designed for work-tracker data; it is not intended to read unrelated personal documents, photos, microphone/camera content or passwords. Contact your organization privacy/IT contact for access, retention or policy questions.\n\n'
+        + 'Select OK to acknowledge that you have read this notice.'
+    );
+    if (accepted) {
+        GM_setValue('trackerPrivacyNoticeVersionAccepted', '1.0');
+        GM_setValue('trackerPrivacyNoticeAcceptedAt', new Date().toISOString());
+        showTrackerNotice('Privacy Notice v1.0 acknowledged.', 6000);
+    } else {
+        showTrackerNotice('Privacy Notice was not acknowledged. You can reopen it from Settings.', 10000);
+    }
+    return accepted;
+}
+
+// =========================================
+// FUNCTION RENDER SHIFT START CONTROL
+// Search: renderShiftStartControl
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function renderShiftStartControl() {
+
+    const hasMode = trackingMode === 1 || trackingMode === 2;
+    for (const id of ['tracker-start-btn', 'floating-start-btn']) {
+        const button = $(id);
+        if (!button) continue;
+        button.classList.toggle('active', shiftStarted);
+        if (shiftStarted) {
+            button.disabled = true;
+            button.textContent = 'Shift Started';
+            button.title = shiftStartedAt ? 'Started ' + new Date(shiftStartedAt).toLocaleTimeString('en-US', { timeZone: 'Asia/Manila', hour12: true }) : 'Shift tracking is active';
+        } else if (!hasMode) {
+            button.disabled = true;
+            button.textContent = 'Select Mode First';
+            button.title = 'Choose Confirmation or Coverage before starting';
+        } else {
+            button.disabled = false;
+            button.textContent = 'Start Shift';
+            button.title = 'Start Active and Idle tracking now';
+        }
+    }
+    for (const id of ['tracker-end-btn', 'floating-end-btn']) {
+        const button = $(id);
+        if (!button) continue;
+        button.style.display = shiftStarted ? '' : 'none';
+        button.disabled = !shiftStarted;
+    }
+    renderShiftWall();
+    renderControllerIdentity();
+
+}
+
+// =========================================
+// FUNCTION START SHIFT FROM OVERLAY
+// Search: startShiftFromOverlay
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function startShiftFromOverlay() {
+
+    if (!controllerConnected) {
+        showTrackerNotice('Controller disconnected. Retry the controller connection before starting shift.', 10000);
+        renderShiftWall();
+        return;
+    }
+    const startAt = Date.now();
+    const prospective = getProspectiveShiftPolicy(startAt);
+    const expectedEnd = new Date(startAt + prospective.regularWindowMinutes * 60 * 1000).toLocaleTimeString('en-US', { timeZone: 'Asia/Manila', hour12: true });
+    if (!window.confirm(
+        'Start Shift now?\n\nDepartment: ' + prospective.department
+        + '\nRegular window: ' + formatShiftMinutes(prospective.regularWindowMinutes)
+        + '\nPause allowance: ' + prospective.pauseSummary
+        + '\nRegular intervals: ' + prospective.intervalCount
+        + '\nExpected regular end: ' + expectedEnd
+        + '\n\nOvertime starts after the regular window.'
+    )) return;
+    api('POST', '/', { action: 'start_shift', browserInfo: getTrackerBrowserInfo() }, data => {
+        if (!data || data.error || data.success === false) {
+            showTrackerNotice(data?.message || data?.error || 'Unable to start shift.', 10000);
+            return;
+        }
+        updateStats(data);
+        resetIdleTimer();
+        showTrackerNotice(
+            data.clearedPreStartCounters
+                ? 'Shift started. Previous pre-start counters were cleared so tasks and timing use the same measurement window.'
+                : 'Shift started. Active/Idle timing and report counters are now running.',
+            11000
+        );
+        const schedule = data.shiftSchedule || shiftSchedule;
+        showTrackerNotice('Shift started. Regular end: ' + formatTrackerTime(schedule?.regularEndAt) + ' • OT begins: ' + formatTrackerTime(schedule?.overtimeStartsAt), 12000);
+        log('Shift tracking started');
+        renderShiftWall();
+    });
+
+}
+
+function endShiftFromOverlay() {
+    if (!shiftStarted) return;
+    if (!window.confirm('End Shift now?\n\nAuto Tracker will stop timing and generate/update the final daily report.')) return;
+    api('POST', '/', { action: 'end_shift', generateReport: true }, data => {
+        if (!data || data.success === false || data.error) {
+            showTrackerNotice(data?.message || data?.error || 'Unable to end shift.', 12000);
+            return;
+        }
+        updateStats(data);
+        showTrackerNotice(data.report?.drive?.ok === true
+            ? 'Shift ended. Final report updated and sent to Drive.'
+            : 'Shift ended. Final report was generated; check Drive status if upload is pending.', 14000);
+        log('Shift ended');
+        renderShiftWall();
+    });
+}
+
+
+
+// =========================================
+// FUNCTION FORMAT DURATION SHORT
+// Search: formatDurationShort
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function formatDurationShort(seconds) {
+
+    const safe = Math.max(0, Math.floor(Number(seconds || 0)));
+    const hours = Math.floor(safe / 3600);
+    const minutes = Math.floor((safe % 3600) / 60);
+    const secs = safe % 60;
+    return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m ${secs}s`;
+
+}
+
+// =========================================
+// FUNCTION APPLY BREAK STATE
+// Search: applyBreakState
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function normalizePauseState(raw, fallback = {}) {
+    const kind = String(raw?.kind || fallback.kind || 'BREAK').toUpperCase() === 'LUNCH' ? 'LUNCH' : 'BREAK';
+    const totalSeconds = Math.max(0, Number(raw?.totalSeconds ?? fallback.totalSeconds ?? (kind === 'LUNCH' ? 3600 : 1800)));
+    return {
+        onBreak: Boolean(raw?.onBreak),
+        anyPauseActive: Boolean(raw?.anyPauseActive),
+        totalSeconds,
+        usedSeconds: Math.max(0, Number(raw?.usedSeconds ?? fallback.usedSeconds ?? 0)),
+        remainingSeconds: Math.max(0, Number(raw?.remainingSeconds ?? fallback.remainingSeconds ?? totalSeconds)),
+        available: raw?.available !== undefined ? Boolean(raw.available) : Number(raw?.remainingSeconds ?? totalSeconds) > 0,
+        expired: raw?.expired !== undefined ? Boolean(raw.expired) : Number(raw?.remainingSeconds ?? totalSeconds) <= 0,
+        supported: raw?.supported !== undefined ? Boolean(raw.supported) : true,
+        allowanceMinutes: Math.max(0, Number(raw?.allowanceMinutes ?? fallback.allowanceMinutes ?? Math.round(totalSeconds / 60))),
+        kind,
+        label: String(raw?.label || fallback.label || (kind === 'LUNCH' ? 'Lunch Break' : 'Break')),
+        activeKind: raw && Object.prototype.hasOwnProperty.call(raw, 'activeKind') ? raw.activeKind : (fallback.activeKind || null),
+        availableKinds: Array.isArray(raw?.availableKinds) ? [...raw.availableKinds] : (Array.isArray(fallback.availableKinds) ? [...fallback.availableKinds] : [kind]),
+        department: String(raw?.department || fallback.department || shiftSchedule?.department || reportUploadSettingsState.department || 'OOS').toUpperCase()
+    };
+}
+
+function applyBreakState(raw) {
+
+    if (!raw) return;
+    breakState = normalizePauseState(raw, breakState);
+    breakCountdownAnchorAt = Date.now();
+    breakCountdownAnchorRemainingSeconds = breakState.remainingSeconds;
+    updateBreakControl();
+    renderBreakCountdown();
+
+}
+
+function applyPauseStates(raw) {
+    if (!raw) return;
+    pauseStates = {
+        break: normalizePauseState(raw.break || {}, pauseStates.break),
+        lunch: normalizePauseState(raw.lunch || {}, pauseStates.lunch)
+    };
+    const active = pauseStates.break.onBreak ? pauseStates.break : pauseStates.lunch.onBreak ? pauseStates.lunch : null;
+    if (active) {
+        breakState = { ...active };
+        breakCountdownAnchorAt = Date.now();
+        breakCountdownAnchorRemainingSeconds = breakState.remainingSeconds;
+    } else {
+        const preferredKind = String(breakState.kind || '').toUpperCase() === 'LUNCH' ? 'lunch' : 'break';
+        const neutral = pauseStates[preferredKind] || pauseStates.break || pauseStates.lunch || breakState;
+        breakState = {
+            ...neutral,
+            onBreak: false,
+            anyPauseActive: false,
+            activeKind: null
+        };
+        breakCountdownAnchorAt = Date.now();
+        breakCountdownAnchorRemainingSeconds = Math.max(0, Number(breakState.remainingSeconds || 0));
+    }
+    updateBreakControl();
+    renderBreakCountdown();
+}
+
+
+function applySpecialSessionState(raw) {
+
+    if (!raw) return;
+    const normalize = (type, fallbackSeconds) => {
+        const source = raw[type] || specialSessionState[type] || {};
+        return {
+            totalSecondsPerSession: Math.max(0, Number(source.totalSecondsPerSession ?? fallbackSeconds)),
+            maxSessions: Math.max(1, Number(source.maxSessions ?? 1)),
+            currentSession: Math.max(1, Number(source.currentSession ?? 1)),
+            currentRemainingSeconds: Math.max(0, Number(source.currentRemainingSeconds ?? fallbackSeconds)),
+            sessionsRemainingAfterCurrent: Math.max(0, Number(source.sessionsRemainingAfterCurrent ?? 0)),
+            exhausted: Boolean(source.exhausted),
+            active: Boolean(source.active)
+        };
+    };
+    specialSessionState = {
+        date: raw.date || specialSessionState.date || null,
+        activeType: raw.activeType || null,
+        BIO: normalize('BIO', 900),
+        HBIO: normalize('HBIO', 600)
+    };
+    specialCountdownAnchorAt = Date.now();
+    const active = specialSessionState.activeType ? specialSessionState[specialSessionState.activeType] : null;
+    specialCountdownAnchorRemainingSeconds = active ? active.currentRemainingSeconds : 0;
+    renderSpecialSessionControls();
+    updateBreakControl();
+
+}
+
+function getLiveSpecialRemainingSeconds(now = Date.now()) {
+
+    const type = specialSessionState.activeType;
+    if (!type) return 0;
+    const elapsed = Math.max(0, Math.floor((now - specialCountdownAnchorAt) / 1000));
+    return Math.max(0, Math.floor(Number(specialCountdownAnchorRemainingSeconds || 0)) - elapsed);
+
+}
+
+
+// =========================================
+// FUNCTION RENDER SPECIAL SESSION CONTROLS
+// Search: renderSpecialSessionControls
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function renderSpecialSessionControls() {
+
+    const activeType = specialSessionState.activeType;
+    const liveRemaining = getLiveSpecialRemainingSeconds();
+    for (const type of ['BIO', 'HBIO']) {
+        const state = specialSessionState[type];
+        if (!state) continue;
+        const active = activeType === type;
+        const remaining = active ? liveRemaining : state.currentRemainingSeconds;
+        const floatingRow = $(type === 'BIO' ? 'floating-bio-row' : 'floating-hbio-row');
+        if (floatingRow) floatingRow.style.display = active ? 'flex' : 'none';
+        const label = state.exhausted
+            ? 'Finished'
+            : `S${state.currentSession}/${state.maxSessions} ${formatBreakCountdown(remaining)}`;
+        const ids = type === 'BIO'
+            ? ['bio-session-status', 'floating-bio-status']
+            : ['hbio-session-status', 'floating-hbio-status'];
+        for (const id of ids) {
+            const el = $(id);
+            if (el) {
+                el.textContent = label;
+                el.style.color = state.exhausted ? 'var(--tracker-muted)' : active ? 'var(--tracker-warning)' : 'var(--tracker-text)';
+            }
+        }
+        const buttonIds = type === 'BIO'
+            ? ['tracker-bio-btn', 'floating-bio-btn']
+            : ['tracker-hbio-btn', 'floating-hbio-btn'];
+        for (const id of buttonIds) {
+            const button = $(id);
+            if (!button) continue;
+            button.disabled = Boolean(!shiftStarted || (activeType && activeType !== type) || breakState.onBreak || state.exhausted);
+            if (!shiftStarted) {
+                button.textContent = type + ' ' + (type === 'BIO' ? '15m' : '10m');
+                button.title = 'Start Shift first';
+            } else if (active) {
+                button.textContent = type + ' ' + formatBreakCountdown(remaining);
+                button.title = 'Click to resume work early';
+                button.disabled = false;
+            } else if (state.exhausted) {
+                button.textContent = type + ' Finished';
+                button.title = 'Daily ' + type + ' allowance fully consumed';
+            } else {
+                button.textContent = type + ' ' + (type === 'BIO' ? '15m' : '10m');
+                button.title = `Session ${state.currentSession}/${state.maxSessions} remaining: ${formatDurationShort(state.currentRemainingSeconds)}`;
+            }
+        }
+    }
+
+}
+
+
+// =========================================
+// FUNCTION GET LIVE BREAK REMAINING SECONDS
+// Search: getLiveBreakRemainingSeconds
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// =========================================
+function getLiveBreakRemainingSeconds(now = Date.now()) {
+
+    const onBreakNow = breakState.onBreak || currentStatus === 'BREAK';
+    if (!onBreakNow) return Math.max(0, Number(breakState.remainingSeconds || 0));
+    const elapsed = Math.max(0, Math.floor((now - breakCountdownAnchorAt) / 1000));
+    return Math.max(0, Math.floor(Number(breakCountdownAnchorRemainingSeconds || 0)) - elapsed);
+
+}
+
+// =========================================
+// FUNCTION FORMAT BREAK COUNTDOWN
+// Search: formatBreakCountdown
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// =========================================
+function formatBreakCountdown(seconds) {
+
+    const safe = Math.max(0, Math.floor(Number(seconds || 0)));
+    const minutes = Math.floor(safe / 60);
+    const secs = safe % 60;
+    return String(minutes).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+
+}
+
+// =========================================
+// FUNCTION RENDER BREAK COUNTDOWN
+// Search: renderBreakCountdown
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// =========================================
+function renderBreakCountdown() {
+
+    const countdown = $('break-countdown');
+    if (!countdown) return;
+    const remaining = getLiveBreakRemainingSeconds();
+    countdown.textContent = formatBreakCountdown(remaining);
+    countdown.style.color = remaining <= 60 ? '#f87171' : remaining <= 300 ? '#facc15' : '#fff';
+
+}
+
+// =========================================
+// FUNCTION UPDATE BREAK CONTROL
+// Search: updateBreakControl
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function updateBreakControl() {
+
+    const activeKind = String(breakState.activeKind || (breakState.onBreak ? breakState.kind : '') || '').toUpperCase();
+    const onBreakNow = Boolean(activeKind) || currentStatus === 'BREAK';
+    const specialType = specialSessionState.activeType;
+    const overlay = $('tracker-overlay');
+    if (overlay) overlay.classList.toggle('tracker-break-focus', onBreakNow);
+
+    const breakButtons = [$('tracker-break-toggle'), $('floating-break-toggle')].filter(Boolean);
+    const lunchButtons = [$('tracker-lunch-toggle'), $('floating-lunch-toggle')].filter(Boolean);
+    const breakInfo = pauseStates.break || breakState;
+    const lunchInfo = pauseStates.lunch || breakState;
+    const showBreak = shiftStarted && breakInfo.supported !== false && Number(breakInfo.totalSeconds || 0) > 0;
+    const showLunch = shiftStarted && lunchInfo.supported !== false && Number(lunchInfo.totalSeconds || 0) > 0;
+
+    for (const button of breakButtons) button.style.display = showBreak ? '' : 'none';
+    for (const button of lunchButtons) button.style.display = showLunch ? '' : 'none';
+
+    const configureButtons = (buttons, info, label, kind) => {
+        const allowanceMinutes = Math.max(0, Number(info.allowanceMinutes || Math.round(Number(info.totalSeconds || 0) / 60)));
+        for (const button of buttons) {
+            if (activeKind === kind) {
+                button.disabled = false;
+                button.textContent = 'Resume ' + label;
+                button.title = 'Resume work';
+            } else if (onBreakNow || specialType) {
+                button.disabled = true;
+                button.textContent = label;
+                button.title = onBreakNow ? 'Resume the active pause first' : ('Resume ' + specialType + ' first');
+            } else if (info.expired || info.remainingSeconds <= 0 || info.available === false) {
+                button.disabled = true;
+                button.textContent = label + ' Finished';
+                button.title = allowanceMinutes + '-minute ' + label.toLowerCase() + ' allowance already used';
+            } else {
+                button.disabled = false;
+                const mins = Math.ceil(Number(info.remainingSeconds || 0) / 60);
+                button.textContent = mins < allowanceMinutes ? label + ' (' + mins + 'm left)' : label;
+                button.title = label + ' allowance remaining: ' + formatDurationShort(info.remainingSeconds);
+            }
+        }
+    };
+
+    configureButtons(breakButtons, breakInfo, 'Break', 'BREAK');
+    configureButtons(lunchButtons, lunchInfo, 'Lunch Break', 'LUNCH');
+
+    const activeLabel = activeKind === 'LUNCH' ? 'Lunch Break' : activeKind === 'BREAK' ? 'Break' : (showBreak && showLunch ? 'Break + Lunch' : showLunch ? 'Lunch Break' : 'Break');
+    const breakFocusButton = $('break-focus-resume');
+    const breakFocusLabel = $('break-focus-label');
+    if (breakFocusLabel) breakFocusLabel.textContent = activeLabel.toUpperCase() + ' TIME REMAINING';
+    if ($('tracker-total-pause-label')) $('tracker-total-pause-label').textContent = showBreak && showLunch ? 'Pause' : (showLunch ? 'Lunch' : 'Break');
+    if ($('floating-total-pause-label')) $('floating-total-pause-label').textContent = showBreak && showLunch ? 'Pause' : (showLunch ? 'Lunch' : 'Break');
+    renderBreakCountdown();
+
+    if (breakFocusButton) {
+        breakFocusButton.disabled = !onBreakNow;
+        breakFocusButton.textContent = 'Resume';
+    }
+    renderSpecialSessionControls();
+
+}
+
+// =========================================
+// FUNCTION SHOW TRACKER NOTICE
+// Search: showTrackerNotice
+// Ver 0.0.8 Alpha || 2026-09-15 || JBallados
+// =========================================
+function showTrackerNotice(message, durationMs = 10000) {
+
+    const notice = $('tracker-notice');
+    if (!notice) return;
+    notice.textContent = message;
+    notice.style.display = 'block';
+    clearTimeout(showTrackerNotice.timer);
+    showTrackerNotice.timer = setTimeout(() => {
+        notice.style.display = 'none';
+    }, durationMs);
+
+}
+
+// =========================================
+// FUNCTION GET LIVE MODE TIMING
+// Search: getLiveModeTiming
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function getLiveModeTiming(now = Date.now()) {
+
+    const copy = {
+        mode1: { ...modeTimingStats.mode1 },
+        mode2: { ...modeTimingStats.mode2 }
+    };
+    const key = Number(liveTimingAnchorMode) === 1 ? 'mode1' : Number(liveTimingAnchorMode) === 2 ? 'mode2' : null;
+    const elapsedSeconds = Math.max(0, Math.floor((now - liveTimingAnchorAt) / 1000));
+    if (shiftStarted && key && elapsedSeconds > 0) {
+        const status = String(liveTimingAnchorStatus || 'ACTIVE').toUpperCase();
+        const field = status === 'IDLE' ? 'idleSeconds'
+            : status === 'BREAK' ? 'breakSeconds'
+            : status === 'BIO' ? 'bioSeconds'
+            : status === 'HBIO' ? 'hbioSeconds'
+            : 'activeSeconds';
+        copy[key][field] = Math.max(0, Number(copy[key][field] || 0)) + elapsedSeconds;
+    }
+    return copy;
+
+}
+
+// =========================================
+// FUNCTION REBASE LIVE MODE TIMING
+// Search: rebaseLiveModeTiming
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function rebaseLiveModeTiming(nextMode = trackingMode, nextStatus = currentStatus, now = Date.now()) {
+
+    modeTimingStats = getLiveModeTiming(now);
+    liveTimingAnchorAt = now;
+    liveTimingAnchorMode = Number(nextMode);
+    liveTimingAnchorStatus = nextStatus || 'ACTIVE';
+
+}
+
+// =========================================
+// FUNCTION RENDER LIVE MODE TIMING
+// Search: renderLiveModeTiming
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function renderLiveModeTiming() {
+
+    const live = getLiveModeTiming();
+    const combined = {
+        activeSeconds: Math.max(0, Number(live.mode1.activeSeconds || 0)) + Math.max(0, Number(live.mode2.activeSeconds || 0)),
+        idleSeconds: Math.max(0, Number(live.mode1.idleSeconds || 0)) + Math.max(0, Number(live.mode2.idleSeconds || 0)),
+        breakSeconds: Math.max(0, Number(live.mode1.breakSeconds || 0)) + Math.max(0, Number(live.mode2.breakSeconds || 0))
+    };
+    const activeText = formatDurationShort(combined.activeSeconds);
+    const idleText = formatDurationShort(combined.idleSeconds);
+    const breakText = formatDurationShort(combined.breakSeconds);
+    const useLunch = shiftStarted && String(breakState.kind || '').toUpperCase() === 'LUNCH';
+    if ($('tracker-total-pause-label')) $('tracker-total-pause-label').textContent = useLunch ? 'Lunch' : 'Break';
+    if ($('floating-total-pause-label')) $('floating-total-pause-label').textContent = useLunch ? 'Lunch' : 'Break';
+    if ($('tracker-total-active')) $('tracker-total-active').innerText = activeText;
+    if ($('tracker-total-idle')) $('tracker-total-idle').innerText = idleText;
+    if ($('tracker-total-break')) $('tracker-total-break').innerText = breakText;
+    if ($('floating-total-active')) $('floating-total-active').innerText = activeText;
+    if ($('floating-total-idle')) $('floating-total-idle').innerText = idleText;
+    if ($('floating-total-break')) $('floating-total-break').innerText = breakText;
+
+}
+
+// =========================================
+// FUNCTION RENDER ACTIVE MODE TITLE
+// Search: renderActiveModeTitle
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function renderActiveModeTitle() {
+
+    const overlay = $('tracker-overlay');
+    if (overlay) {
+        overlay.classList.toggle('tracker-mode1-selected', trackingMode === 1);
+        overlay.classList.toggle('tracker-mode2-selected', trackingMode === 2);
+    }
+    if ($('mode1-section-title')) $('mode1-section-title').classList.toggle('mode-active', trackingMode === 1);
+    if ($('mode2-section-title')) $('mode2-section-title').classList.toggle('mode-active', trackingMode === 2);
+    if ($('floating-mode1-btn')) $('floating-mode1-btn').classList.toggle('active', trackingMode === 1);
+    if ($('floating-mode2-btn')) $('floating-mode2-btn').classList.toggle('active', trackingMode === 2);
+    if ($('floating-mode1-card')) $('floating-mode1-card').classList.toggle('active-mode', trackingMode === 1);
+    if ($('floating-mode2-card')) $('floating-mode2-card').classList.toggle('active-mode', trackingMode === 2);
+    if ($('floating-mode')) {
+        $('floating-mode').textContent = trackingMode === 1 ? 'MODE 1 — CONFIRMATION' : trackingMode === 2 ? 'MODE 2 — COVERAGE' : 'MODE NOT SET';
+        $('floating-mode').style.color = trackingMode === 1 || trackingMode === 2 ? '#4ade80' : '#facc15';
+    }
+
+}
+
+// =========================================
+// FUNCTION DETECT EXPECTED TRACKING MODE
+// Search: detectExpectedTrackingMode
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function detectExpectedTrackingMode() {
+
+    const route = (location.pathname + location.search).toLowerCase();
+    if (route.includes('coverage-beta')) return 2;
+    return null;
+
+}
+
+// =========================================
+// FUNCTION REFRESH MODE MISMATCH WARNING
+// Search: refreshModeMismatchWarning
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function refreshModeMismatchWarning() {
+
+    const warning = $('mode-mismatch-warning');
+    const overlay = $('tracker-overlay');
+    if (!warning || !overlay) return;
+    const expectedMode = detectExpectedTrackingMode();
+    const mismatch = expectedMode !== null && expectedMode !== trackingMode;
+    const visible = mismatch && !modeMismatchBypassNextAction;
+    warning.style.display = visible ? 'block' : 'none';
+    overlay.classList.toggle('tracker-warning', mismatch);
+    if (visible && $('mode-mismatch-text')) {
+        $('mode-mismatch-text').textContent = `Page: COVERAGE | Tracker: ${trackingMode === 1 ? 'CONFIRMATION' : 'NOT SET'}. Switch modes before the task is counted.`;
+    }
+
+}
+
+// =========================================
+// FUNCTION MODE MISMATCH DECISION
+// Search: modeMismatchDecision
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function modeMismatchDecision() {
+
+    const expectedMode = detectExpectedTrackingMode();
+    if (expectedMode === null || expectedMode === trackingMode) return 'ok';
+    if (modeMismatchBypassNextAction) {
+        modeMismatchBypassNextAction = false;
+        setTimeout(refreshModeMismatchWarning, 0);
+        return 'bypass';
+    }
+    refreshModeMismatchWarning();
+    return 'block';
+
+}
+
+// =========================================
+// FUNCTION GET INSTALLED TAMPERMONKEY VERSION
+// Search: getInstalledTampermonkeyVersion
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function getInstalledTampermonkeyVersion() {
+
+    try {
+        return GM_info?.script?.version ? String(GM_info.script.version) : null;
+    } catch {
+        return null;
+    }
+
+}
+
+// =========================================
+// FUNCTION GET INSTALLED TAMPERMONKEY IDENTITY
+// Search: getInstalledTampermonkeyIdentity
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function getInstalledTampermonkeyIdentity() {
+
+    try {
+        const script = GM_info?.script || {};
+        const name = script.name ? String(script.name) : '';
+        const namespace = script.namespace ? String(script.namespace) : '';
+        const version = script.version ? String(script.version) : '';
+        if (!name || !namespace) return null;
+        return { name, namespace, version, revision: TRACKER_RELEASE_REVISION };
+    } catch {
+        return null;
+    }
+
+}
+
+// =========================================
+// FUNCTION OPEN TAMPERMONKEY UPDATE TAB
+// Search: openTampermonkeyUpdateTab
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function openTampermonkeyUpdateTab() {
+
+    const tab = window.open('about:blank', '_blank');
+    if (!tab) {
+        showTrackerNotice('Browser blocked the update tab. Allow pop-ups for this site and try again.', 14000);
+        return null;
+    }
+    try {
+        tab.document.title = 'Auto Tracker — Checking Update';
+        tab.document.body.innerHTML = '<div style="font-family:Segoe UI,sans-serif;padding:24px;">Checking Auto Tracker userscript update...</div>';
+    } catch {}
+    return tab;
+
+}
+
+// =========================================
+// FUNCTION SELECT TAMPERMONKEY UPDATE FILE
+// Search: selectTampermonkeyUpdateFile
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function selectTampermonkeyUpdateFile() {
+
+    const picker = $('tracker-tamper-file');
+    if (!picker) {
+        showTrackerNotice('Tampermonkey file picker is unavailable.', 10000);
+        return;
+    }
+    picker.value = '';
+    picker.click();
+
+}
+
+// =========================================
+// FUNCTION CHECK TAMPERMONKEY UPDATE
+// Search: checkTampermonkeyUpdateFromController
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function checkTampermonkeyUpdateFromController() {
+
+    showTrackerNotice('Checking Tampermonkey update...', 6000);
+    const updateTab = openTampermonkeyUpdateTab();
+    if (!updateTab) return;
+
+    const installedIdentity = getInstalledTampermonkeyIdentity();
+    const installedVersion = installedIdentity?.version || getInstalledTampermonkeyVersion();
+    log('Checking TamperMonkey Mods source folder...');
+    api('POST', '/', {
+        action: 'tampermonkey_check_update',
+        installedIdentity,
+        installedVersion,
+        installedRevision: TRACKER_RELEASE_REVISION,
+        browserInfo: getTrackerBrowserInfo()
+    }, data => {
+        if (!data || data.success === false) {
+            try { updateTab.close(); } catch {}
+            const choose = window.confirm(
+                'No usable TamperMonkey Mods file was found in the controller source folder.\n\nSelect a TamperMonkey Mods file manually?'
+            );
+            if (choose) selectTampermonkeyUpdateFile();
+            return;
+        }
+
+        const controllerVersion = data.controller?.version || 'Unknown';
+        const controllerRevisionValue = Number(data.controller?.revision || 0);
+        const installed = data.installedVersion || installedVersion || 'Unknown';
+        const installedRevisionValue = Number(data.installedRevision ?? TRACKER_RELEASE_REVISION);
+
+        if (data.updateAvailable) {
+            showTrackerNotice(
+                'Update available. Opening existing Auto Tracker userscript update: v' + installed + '-r' + installedRevisionValue
+                + ' → v' + controllerVersion + '-r' + controllerRevisionValue
+                + '. Tampermonkey will update the existing script instead of creating a second copy.',
+                15000
+            );
+            log('Tampermonkey update: v' + installed + '-r' + installedRevisionValue + ' → v' + controllerVersion + '-r' + controllerRevisionValue);
+            updateTab.location.href = data.applyUrl || (SERVER + '/tampermonkey.user.js');
+            return;
+        }
+
+        try { updateTab.close(); } catch {}
+        const choose = window.confirm(
+            'TamperMonkey Mods release: v' + controllerVersion + '-r' + controllerRevisionValue + '\n' +
+            'Installed release: v' + installed + '-r' + installedRevisionValue + '\n\n' +
+            'No newer version/revision was detected. Select a TamperMonkey Mods file manually?'
+        );
+        if (choose) selectTampermonkeyUpdateFile();
+        else log('Tampermonkey is current');
+    });
+
+}
+
+// =========================================
+// FUNCTION HANDLE TAMPERMONKEY UPDATE FILE
+// Search: handleTampermonkeyUpdateFile
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function handleTampermonkeyUpdateFile(event) {
+
+    const file = event?.target?.files?.[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+        showTrackerNotice('Selected TamperMonkey Mods file is too large. Maximum: 2 MB.', 12000);
+        return;
+    }
+
+    const updateTab = openTampermonkeyUpdateTab();
+    if (!updateTab) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+        const installedIdentity = getInstalledTampermonkeyIdentity();
+        const installedVersion = installedIdentity?.version || getInstalledTampermonkeyVersion();
+        api('POST', '/', {
+            action: 'tampermonkey_stage_update',
+            installedIdentity,
+            installedVersion,
+            installedRevision: TRACKER_RELEASE_REVISION,
+            source: String(reader.result || '')
+        }, data => {
+            if (!data || data.success === false) {
+                try { updateTab.close(); } catch {}
+                showTrackerNotice('Tampermonkey update rejected: ' + (data?.message || data?.error || 'Invalid userscript.'), 15000);
+                log('Tampermonkey update rejected');
+                return;
+            }
+
+            if (data.status === 'CURRENT' && !data.updateAvailable) {
+                try { updateTab.close(); } catch {}
+                showTrackerNotice('Selected TamperMonkey Mods is already current. No overwrite was needed.', 12000);
+                log('Tampermonkey source is current');
+                return;
+            }
+
+            const version = data.controller?.version || 'Unknown';
+            showTrackerNotice(
+                'TamperMonkey Mods v' + version +
+                ' is ready. Opening the update in this same browser with the current script identity so Tampermonkey overwrites the existing userscript.',
+                17000
+            );
+            log('Tampermonkey update ready: v' + version);
+            updateTab.location.href = data.applyUrl || (SERVER + '/tampermonkey.user.js');
+        });
+    };
+    reader.onerror = () => {
+        try { updateTab.close(); } catch {}
+        showTrackerNotice('Could not read the selected TamperMonkey Mods file.', 12000);
+    };
+    reader.readAsText(file);
+
+}
+
+// =========================================
+// FUNCTION SEND TRACKER ACTION
+// Search: sendTrackerAction
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function requestIntervalReset(confirmEarly = false) {
+
+    api('POST', '/', { action: 'reset', confirmEarly }, data => {
+        if (!data) {
+            log('Controller unavailable');
+            return;
+        }
+
+        if (data.requiresConfirmation) {
+            const boundary = formatTrackerTime(data.scheduledBoundaryAt);
+            const confirmed = window.confirm(
+                'EARLY INTERVAL RESET WARNING\n\n'
+                + (data.message || 'This reset is before the scheduled interval boundary.') + '\n\n'
+                + 'Scheduled boundary: ' + boundary + '\n\n'
+                + 'If you continue, the next interval starts early. Another manual interval reset will be blocked until this boundary, and the automatic scheduler will NOT advance again at that boundary.\n\n'
+                + 'Continue with the early reset?'
+            );
+            if (confirmed) requestIntervalReset(true);
+            else {
+                log('Early interval reset cancelled');
+                showTrackerNotice('Interval reset cancelled. Current interval continues until its scheduled boundary.', 9000);
+            }
+            return;
+        }
+
+        if (data.error || data.success === false) {
+            const reason = data.message || data.error || 'Interval reset could not be completed.';
+            log('⚠ ' + reason);
+            showTrackerNotice(reason, 12000);
+            return;
+        }
+
+        updateStats(data);
+        loadStats();
+        const message = data.early
+            ? 'Interval reset early. Next manual reset is locked until ' + formatTrackerTime(data.scheduledBoundaryAt) + '.'
+            : 'Interval reset completed.';
+        log(data.message || message);
+        showTrackerNotice(message, data.early ? 12000 : 7000);
+    });
+
+}
+
+function sendTrackerAction(action, payload = {}, message = '') {
+
+    api('POST', '/', { action, ...payload }, data => {
+        if (!data) {
+            log('Controller unavailable');
+            return;
+        }
+        if (data.error || data.success === false) {
+            log('⚠ ' + (data.message || data.error || 'Command failed'));
+            if (data.breakState) applyBreakState(data.breakState);
+            if (data.specialSessionState) applySpecialSessionState(data.specialSessionState);
+            return;
+        }
+        updateStats(data);
+        loadStats();
+        if (message) log(message);
+    });
+
+}
+
+// =========================================
+// FUNCTION SWITCH TRACKING MODE
+// Search: switchTrackingMode
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// =========================================
+function switchTrackingMode(mode) {
+
+    api('POST', '/', { action: 'set_tracking_mode', mode }, data => {
+        if (!data || data.error || data.success === false) {
+            const reason = data?.message || data?.error || 'Unable to change tracking mode';
+            log('⚠ ' + reason);
+            return;
+        }
+        modeMismatchBypassNextAction = false;
+        updateStats(data);
+        refreshModeMismatchWarning();
+        log(mode === 2 ? 'Coverage mode selected' : 'Confirmation mode selected');
+    });
+
+}
+
+// =========================================
+// FUNCTION HANDLE TRACKER CONTROL CLICK
+// Search: handleTrackerControlClick
+// Ver 0.1.13 Alpha || 2026-09-27 || JBallados || Hide_Backend_Upload_Details
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function handleTrackerControlClick(event) {
+
+    const button = event.target instanceof Element ? event.target.closest('[data-tracker-action]') : null;
+    if (!button || button.disabled) return;
+    const action = button.dataset.trackerAction;
+    if (action === 'collapse') {
+        setTrackerCollapsed(!trackerCollapsed);
+    } else if (action === 'dock-left') {
+        setTrackerLayout('left');
+    } else if (action === 'dock-right') {
+        setTrackerLayout('right');
+    } else if (action === 'floating') {
+        setTrackerLayout('floating');
+    } else if (action === 'settings') {
+        setTrackerSettingsOpen(true);
+    } else if (action === 'settings-close') {
+        setTrackerSettingsOpen(false);
+    } else if (action === 'settings-save') {
+        saveTrackerSettings();
+    } else if (action === 'upload-settings-save') {
+        saveReportUploadSettingsToController();
+    } else if (action === 'start-shift') {
+        startShiftFromOverlay();
+    } else if (action === 'end-shift') {
+        endShiftFromOverlay();
+    } else if (action === 'retry-controller') {
+        loadStats();
+    } else if (action === 'check-updates') {
+        checkAutoTrackerRelease(true);
+    } else if (action === 'install-release') {
+        installAutoTrackerRelease();
+    } else if (action === 'restart-controller') {
+        restartControllerAfterUpdate();
+    } else if (action === 'view-errors') {
+        viewRecentTrackerErrors();
+    } else if (action === 'export-diagnostics') {
+        exportTrackerDiagnostics();
+    } else if (action === 'privacy-notice') {
+        showPrivacyNotice();
+    } else if (action === 'mode1') {
+        switchTrackingMode(1);
+    } else if (action === 'mode2') {
+        switchTrackingMode(2);
+    } else if (action === 'bypass-mismatch') {
+        modeMismatchBypassNextAction = true;
+        refreshModeMismatchWarning();
+        log('Next mismatched task will continue untracked');
+    } else if (action === 'bio') {
+        if (specialSessionState.activeType === 'BIO') {
+            sendTrackerAction('resume', {}, 'BIO ended');
+        } else if (!specialSessionState.activeType && !breakState.onBreak && !specialSessionState.BIO?.exhausted) {
+            sendTrackerAction('bio', {}, 'BIO started');
+        }
+    } else if (action === 'hbio') {
+        if (specialSessionState.activeType === 'HBIO') {
+            sendTrackerAction('resume', {}, 'HBIO ended');
+        } else if (!specialSessionState.activeType && !breakState.onBreak && !specialSessionState.HBIO?.exhausted) {
+            sendTrackerAction('hbio', {}, 'HBIO started');
+        }
+    } else if (action === 'break-toggle') {
+        const info = pauseStates.break || breakState;
+        if (String(breakState.activeKind || '').toUpperCase() === 'BREAK' || breakState.onBreak || currentStatus === 'BREAK' || specialSessionState.activeType) {
+            sendTrackerAction('resume', {}, 'Work resumed');
+        } else if (info.supported !== false && !info.expired && info.remainingSeconds > 0) {
+            sendTrackerAction('break', {}, 'Break started');
+        }
+    } else if (action === 'lunch-toggle') {
+        const info = pauseStates.lunch || breakState;
+        if (String(breakState.activeKind || '').toUpperCase() === 'LUNCH' || breakState.onBreak || currentStatus === 'BREAK' || specialSessionState.activeType) {
+            sendTrackerAction('resume', {}, 'Work resumed');
+        } else if (info.supported !== false && !info.expired && info.remainingSeconds > 0) {
+            sendTrackerAction('lunch', {}, 'Lunch Break started');
+        }
+    } else if (action === 'reset') {
+        requestIntervalReset(false);
+    } else if (action === 'tampermonkey-update') {
+        checkTampermonkeyUpdateFromController();
+    } else if (action === 'report') {
+        const lastName = String(trackerAgentLastName || reportSettingsState?.lastName || '').trim();
+        if (!lastName) {
+            showTrackerNotice('Complete First-Time Setup in Tracker Settings before generating a report.', 11000);
+            setTrackerSettingsOpen(true);
+            return;
+        }
+        log('Updating today\'s report and TXT log...');
+        api('POST', '/', {
+            action: 'report',
+            lastName
+        }, data => {
+            if (!data) {
+                log('Report request failed');
+                return;
+            }
+            if (data.success) {
+                renderReportStatus({
+                    state: data.drive?.ok === true ? 'VERIFIED' : data.drive?.ok === false ? 'PENDING' : 'LOCAL',
+                    generatedAt: Date.now(),
+                    reportFileName: data.reportFileName || null
+                });
+                const driveMessage = data.drive?.ok === true
+                    ? ' + Drive uploaded'
+                    : data.drive?.ok === false
+                        ? ' + Drive upload warning'
+                        : ' + local only';
+                log('Report generated: ' + (data.reportFileName || 'complete') + driveMessage);
+                if (data.appsScriptUpload?.partialFailure) {
+                    const failedFiles = (data.appsScriptUpload.results || [])
+                        .filter(item => !item.ok)
+                        .map(item => item.fileName)
+                        .filter(Boolean);
+                    console.warn('[AUTO TRACKER] Google Drive partial upload failure:', data.appsScriptUpload);
+                    showTrackerNotice(
+                        failedFiles.length
+                            ? 'Report saved locally. One Google Drive file could not be updated.'
+                            : 'Report saved locally. Google Drive upload was only partially completed.',
+                        14000
+                    );
+                } else if (data.drive?.ok === false) {
+                    console.warn('[AUTO TRACKER] Google Drive upload failure:', data.drive);
+                    showTrackerNotice(
+                        'Report saved locally. Google Drive upload could not be completed. If this continues, contact IT Support.',
+                        14000
+                    );
+                } else if (data.drive?.ok === true) {
+                    showTrackerNotice('Today\'s Excel report and TXT log were updated in Google Drive. Existing same-day files are replaced.', 11000);
+                } else {
+                    showTrackerNotice('Today\'s Excel report and TXT log were updated locally.', 8000);
+                }
+            } else {
+                log('Report failed: ' + (data.error || 'No activity to report'));
+            }
+        });
+    } else if (action === 'reset-all') {
+        const confirmed = window.confirm(
+            'RESET ALL TRACKER DATA?\n\n'
+            + 'This clears today\'s Confirmation/Coverage counters, jobs, Active/Idle timing, Break, BIO/HBIO usage, and interval history.\n\n'
+            + 'Generated report files, Google Drive setup, and the registered device credential will NOT be deleted.\n\n'
+            + 'This tracker-data reset cannot be undone.'
+        );
+        if (confirmed) {
+            setTrackerSettingsOpen(false);
+            sendTrackerAction('reset_all', { confirmResetAll: true }, 'All tracker data reset');
+        }
+    }
+
+}
+
+// =========================================
+// FUNCTION MAKE DRAGGABLE
+// Search: makeDraggable
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function makeDraggable(element, handle, collapsedHandle = null) {
+
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+    let activeHandle = null;
+    const dragHandles = [handle || element, collapsedHandle].filter(Boolean);
+    dragHandles.forEach(dragHandle => dragHandle.addEventListener('pointerdown', startDrag));
+
+    function startDrag(e) {
+        if (trackerLayoutMode !== 'floating' || e.button !== 0) return;
+        const fromCollapsedHandle = collapsedHandle && (e.currentTarget === collapsedHandle || collapsedHandle.contains(e.target));
+        if (trackerCollapsed && !fromCollapsedHandle) return;
+        if (!trackerCollapsed && e.target instanceof Element && e.target.closest('button')) return;
+        isDragging = true;
+        activeHandle = e.currentTarget;
+        startX = e.clientX;
+        startY = e.clientY;
+        startLeft = element.offsetLeft;
+        startTop = element.offsetTop;
+        if (activeHandle?.setPointerCapture) activeHandle.setPointerCapture(e.pointerId);
+        document.addEventListener('pointermove', drag);
+        document.addEventListener('pointerup', stopDrag);
+        e.preventDefault();
+    }
+
+    function drag(e) {
+        if (!isDragging) return;
+        const maxLeft = Math.max(0, window.innerWidth - element.offsetWidth);
+        const maxTop = Math.max(0, window.innerHeight - element.offsetHeight);
+        trackerFloatLeft = Math.min(Math.max(0, startLeft + (e.clientX - startX)), maxLeft);
+        trackerFloatTop = Math.min(Math.max(0, startTop + (e.clientY - startY)), maxTop);
+        element.style.left = trackerFloatLeft + 'px';
+        element.style.top = trackerFloatTop + 'px';
+    }
+
+    function stopDrag(e) {
+        if (!isDragging) return;
+        isDragging = false;
+        GM_setValue('trackerFloatLeft', trackerFloatLeft);
+        GM_setValue('trackerFloatTop', trackerFloatTop);
+        try { if (activeHandle?.releasePointerCapture) activeHandle.releasePointerCapture(e.pointerId); } catch {}
+        activeHandle = null;
+        document.removeEventListener('pointermove', drag);
+        document.removeEventListener('pointerup', stopDrag);
+    }
+
+}
+
+// =========================================
+// FUNCTION START CLOCK
+// Search: startClock
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// =========================================
+function startClock() {
+
+    setInterval(() => {
+        const clock = $("clock");
+        if (clock) {
+            clock.innerText = phTime();
+        }
+        updateJobDisplay();
+        renderLiveModeTiming();
+        renderBreakCountdown();
+        renderSpecialSessionControls();
+    }, 1000);
+
+}
+
+// =========================================
+// FUNCTION SET STATUS
+// Search: setStatus
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function setStatus(status) {
+
+    const nextStatus = status || (shiftStarted ? 'ACTIVE' : 'WAITING');
+    if (nextStatus !== currentStatus) {
+        rebaseLiveModeTiming(trackingMode, nextStatus);
+    }
+    currentStatus = nextStatus;
+    const color = nextStatus === 'ACTIVE' ? '#4ade80'
+        : nextStatus === 'WAITING' ? '#facc15'
+        : nextStatus === 'IDLE' ? '#ef4444'
+        : nextStatus === 'BIO' ? '#38bdf8'
+        : nextStatus === 'HBIO' ? '#c084fc'
+        : '#facc15';
+    if ($('status')) {
+        $('status').innerText = nextStatus;
+        $('status').style.color = color;
+    }
+    if ($('floating-status')) {
+        $('floating-status').innerText = nextStatus;
+        $('floating-status').style.color = color;
+    }
+    renderLiveModeTiming();
+    updateBreakControl();
+    renderSpecialSessionControls();
+
+}
+
+// =========================================
+// FUNCTION LOG
+// Search: log
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function log(message) {
+
+    const el = $("log");
+    if (!el) return;
+    el.innerText = message;
+
+}
+
+function renderReportStatus(raw) {
+    const el = $('tracker-report-status');
+    if (!el) return;
+    const state = raw?.state || 'NONE';
+    if (state === 'NONE') {
+        el.textContent = 'Last report: none';
+        el.style.color = 'var(--tracker-muted)';
+        return;
+    }
+    const when = raw?.generatedAt ? formatTrackerTime(raw.generatedAt) : 'unknown time';
+    const label = state === 'VERIFIED' ? 'Drive: Verified ✓'
+        : state === 'PENDING' ? 'Drive: Pending ⚠'
+            : state === 'FAILED' ? 'Report: Failed ⚠'
+                : 'Local report only';
+    el.textContent = 'Last report: ' + when + ' • ' + label;
+    el.style.color = state === 'VERIFIED' ? 'var(--tracker-success)'
+        : state === 'PENDING' || state === 'FAILED' ? 'var(--tracker-warning)'
+            : 'var(--tracker-muted)';
+}
+
+// =========================================
+// FUNCTION UPDATE STATS
+// Search: updateStats
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function updateStats(data) {
+
+    if (!data) return;
+    console.log('📊 SERVER DATA:', data);
+    if (data.trackingMode !== undefined) {
+        const serverMode = Number(data.trackingMode);
+        if (serverMode === 1 || serverMode === 2) trackingMode = serverMode;
+    }
+    if (data.controllerVersion) controllerVersion = String(data.controllerVersion);
+    if (data.controllerRevision !== undefined) controllerRevision = Math.max(0, Number(data.controllerRevision) || 0);
+    if (data.lastReportStatus !== undefined) renderReportStatus(data.lastReportStatus);
+    if (data.updateInstall !== undefined) updateInstallState = { ...updateInstallState, ...(data.updateInstall || {}) };
+    if (data.latestRelease !== undefined) {
+        latestReleaseState = data.latestRelease || null;
+        if (latestReleaseState?.integrityWarning) {
+            const warningKey = 'trackerReleaseIntegrity_' + String(latestReleaseState.latestVersion || 'unknown') + '_r' + Number(latestReleaseState.latestRevision || 0);
+            if (!GM_getValue(warningKey, false)) {
+                showTrackerNotice('⚠ Release content changed without matching release.json checksums. Update is blocked until IT reviews the Drive release.', 18000);
+                GM_setValue(warningKey, true);
+            }
+        } else if (latestReleaseState?.updateAvailable && latestReleaseState?.latestVersion) {
+            const noticeKey = 'trackerUpdateNotice_' + latestReleaseState.latestVersion + '_r' + Number(latestReleaseState.latestRevision || 0);
+            if (!GM_getValue(noticeKey, false)) {
+                const details = latestReleaseState.release?.details ? '\n' + latestReleaseState.release.details : '';
+                showTrackerNotice(
+                    'Auto Tracker update available: v' + latestReleaseState.latestVersion + '-r' + Number(latestReleaseState.latestRevision || 0)
+                    + ' (' + String(latestReleaseState.reason || 'UPDATE') + '). Open Settings to check update details.' + details,
+                    16000
+                );
+                GM_setValue(noticeKey, true);
+            }
+        }
+    }
+    controllerConnected = true;
+    lastControllerSeenAt = Date.now();
+    if (data.shiftStarted !== undefined) shiftStarted = Boolean(data.shiftStarted);
+    if (data.shiftStartedAt !== undefined) shiftStartedAt = Number(data.shiftStartedAt || 0) || null;
+    if (data.shiftEndedAt !== undefined) shiftEndedAt = Number(data.shiftEndedAt || 0) || null;
+    if (data.shiftSchedule !== undefined) shiftSchedule = data.shiftSchedule || null;
+    if (data.overtime !== undefined) overtimeState = data.overtime || null;
+    if (data.reportSettings) {
+        reportSettingsState = { ...reportSettingsState, ...data.reportSettings };
+        if (data.reportSettings.lastName) {
+            trackerAgentLastName = String(data.reportSettings.lastName).trim();
+            GM_setValue('trackerAgentLastName', trackerAgentLastName);
+        }
+    }
+    if (data.intervalCounters?.mode1) {
+        localCounters.totalTaskCompleted = Number(data.intervalCounters.mode1.taskCompleted) || 0;
+        localCounters.totalJobsCompleted = Number(data.intervalCounters.mode1.jobsCompleted) || 0;
+    }
+    const coverage = data.intervalCounters?.mode2 ?? data.mode2;
+    if (coverage) {
+        mode2Stats.mode2DeletedBoxes = Number(coverage.deletedBoxes) || 0;
+        mode2Stats.mode2TaskCompleted = Number(coverage.taskCompleted) || 0;
+        mode2Stats.mode2JobsCompleted = Number(coverage.jobsCompleted) || 0;
+        mode2Stats.mode2EmptyAreaConfirmation = Number(coverage.emptyAreaConfirmation) || 0;
+        mode2Stats.mode2EmptyAreaNoMatchFound = Number(coverage.emptyAreaNoMatchFound) || 0;
+        mode2Stats.mode2UnblurredPerson = Number(coverage.unblurredPerson) || 0;
+        mode2Stats.mode2SkippedTask = Number(coverage.skippedTask) || 0;
+    }
+    if (data.breakState) applyBreakState(data.breakState);
+    if (data.pauseStates) applyPauseStates(data.pauseStates);
+    if (data.specialSessionState) applySpecialSessionState(data.specialSessionState);
+    if (data.modeTiming) {
+        modeTimingStats = {
+            mode1: { ...modeTimingStats.mode1, ...(data.modeTiming.mode1 || {}) },
+            mode2: { ...modeTimingStats.mode2, ...(data.modeTiming.mode2 || {}) }
+        };
+        liveTimingAnchorAt = Date.now();
+        liveTimingAnchorMode = trackingMode;
+        liveTimingAnchorStatus = data.agentStatus || currentStatus;
+    }
+    if (data.currentInterval && data.currentInterval.number !== undefined) {
+        const serverInterval = Number(data.currentInterval.number);
+        if (Number.isFinite(serverInterval) && serverInterval >= 1) currentIntervalNumber = serverInterval;
+    }
+    renderActiveModeTitle();
+    renderShiftStartControl();
+    populateTrackerSettings();
+    if ($('tracker-mode1-btn')) $('tracker-mode1-btn').classList.toggle('active', trackingMode === 1);
+    if ($('tracker-mode2-btn')) $('tracker-mode2-btn').classList.toggle('active', trackingMode === 2);
+    if ($('mode1-tasks')) $('mode1-tasks').innerText = localCounters.totalTaskCompleted || 0;
+    if ($('mode1-jobs')) $('mode1-jobs').innerText = localCounters.totalJobsCompleted || 0;
+    renderLiveModeTiming();
+    renderUpdateInstallControls();
+    if ($('mode2-tasks')) $('mode2-tasks').innerText = mode2Stats.mode2TaskCompleted || 0;
+    if ($('mode2-jobs')) $('mode2-jobs').innerText = mode2Stats.mode2JobsCompleted || 0;
+
+    if ($('mode2-deleted')) $('mode2-deleted').innerText = mode2Stats.mode2DeletedBoxes || 0;
+    if ($('mode2-empty-confirm')) $('mode2-empty-confirm').innerText = mode2Stats.mode2EmptyAreaConfirmation || 0;
+    if ($('mode2-empty-nomatch')) $('mode2-empty-nomatch').innerText = mode2Stats.mode2EmptyAreaNoMatchFound || 0;
+    if ($('mode2-unblurred')) $('mode2-unblurred').innerText = mode2Stats.mode2UnblurredPerson || 0;
+    if ($('mode2-skipped')) $('mode2-skipped').innerText = mode2Stats.mode2SkippedTask || 0;
+
+    if ($('floating-mode1-tasks')) $('floating-mode1-tasks').innerText = localCounters.totalTaskCompleted || 0;
+    if ($('floating-mode1-jobs')) $('floating-mode1-jobs').innerText = localCounters.totalJobsCompleted || 0;
+    if ($('floating-mode2-tasks')) $('floating-mode2-tasks').innerText = mode2Stats.mode2TaskCompleted || 0;
+    if ($('floating-mode2-jobs')) $('floating-mode2-jobs').innerText = mode2Stats.mode2JobsCompleted || 0;
+    if ($('floating-mode2-deleted')) $('floating-mode2-deleted').innerText = mode2Stats.mode2DeletedBoxes || 0;
+    if ($('floating-mode2-empty-confirm')) $('floating-mode2-empty-confirm').innerText = mode2Stats.mode2EmptyAreaConfirmation || 0;
+    if ($('floating-mode2-empty-nomatch')) $('floating-mode2-empty-nomatch').innerText = mode2Stats.mode2EmptyAreaNoMatchFound || 0;
+    if ($('floating-mode2-unblurred')) $('floating-mode2-unblurred').innerText = mode2Stats.mode2UnblurredPerson || 0;
+    if ($('floating-mode2-skipped')) $('floating-mode2-skipped').innerText = mode2Stats.mode2SkippedTask || 0;
+
+    const displayedJob = data.currentJobId && data.currentJobId !== 'No Active Job Detected' ? data.currentJobId : getJobId();
+    if ($('job')) $('job').innerText = displayedJob;
+    if ($('floating-job')) $('floating-job').innerText = displayedJob;
+    if ($('interval')) $('interval').innerText = getIntervalName(currentIntervalNumber);
+    if ($('floating-interval')) $('floating-interval').innerText = getIntervalName(currentIntervalNumber);
+    if (!shiftStarted) setStatus('WAITING');
+    else if (data.agentStatus) setStatus(data.agentStatus);
+    else if (['ACTIVE', 'IDLE', 'BREAK', 'BIO', 'HBIO'].includes(data.status)) setStatus(data.status);
+    updateBreakControl();
+    renderSpecialSessionControls();
+    refreshModeMismatchWarning();
+
+}
+
+function viewRecentTrackerErrors() {
+    api('POST', '/', { action:'diagnostics_recent', limit:10 }, data => {
+        if (!data || data.success === false) {
+            showTrackerNotice('Unable to load recent diagnostic errors.', 9000);
+            return;
+        }
+        const errors = Array.isArray(data.errors) ? data.errors : [];
+        const summary = $('tracker-error-summary');
+        if (!errors.length) {
+            if (summary) summary.textContent = 'Recent errors: none';
+            showTrackerNotice('No recent structured errors were found.', 7000);
+            return;
+        }
+        const latest = errors[0];
+        if (summary) {
+            summary.textContent = 'Latest: ' + latest.errorCode + ' • ' + latest.component + ' • ' + latest.severity
+                + (data.pendingUploads ? ' • Pending uploads: ' + data.pendingUploads : '');
+        }
+        const readable = errors.slice(0,5).map(item =>
+            item.errorCode + ' | ' + item.component + ' | ' + item.message
+        ).join('\n');
+        const shouldCopy = window.confirm('RECENT AUTO TRACKER ERRORS\n\n' + readable + '\n\nCopy latest Error ID to clipboard?');
+        if (shouldCopy && latest.errorCode) {
+            if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(latest.errorCode).then(() => showTrackerNotice('Copied Error ID: ' + latest.errorCode, 7000)).catch(() => {});
+            } else {
+                window.prompt('Copy this Error ID:', latest.errorCode);
+            }
+        }
+    });
+}
+
+function exportTrackerDiagnostics() {
+    if (!controllerConnected) {
+        showTrackerNotice('Controller disconnected. Diagnostic export is unavailable until it reconnects.', 9000);
+        return;
+    }
+    window.open(SERVER + '/diagnostics.txt', '_blank', 'noopener');
+    showTrackerNotice('Diagnostic export opened. It contains redacted support information only.', 8000);
+}
+
+function installAutoTrackerRelease() {
+    api('POST', '/', { action:'check_for_updates' }, release => {
+        if (!release) {
+            showTrackerNotice('Update check failed: Controller did not respond.', 9000);
+            return;
+        }
+
+        latestReleaseState = release;
+        if (release.updateInstall) updateInstallState = { ...updateInstallState, ...release.updateInstall };
+        renderControllerIdentity();
+
+        if (release.integrityWarning) {
+            showTrackerNotice('Update blocked: Drive release files do not match release.json checksums.', 15000);
+            return;
+        }
+        if (!release.updateAvailable || !release.latestVersion) {
+            showTrackerNotice(
+                'Auto Tracker v' + (controllerVersion || getInstalledTrackerVersion()) + '-r' + Number(controllerRevision || TRACKER_RELEASE_REVISION) + ' is up to date.',
+                8000
+            );
+            return;
+        }
+
+        const details = release.release?.details ? '\n\n' + release.release.details : '';
+        const confirmed = window.confirm(
+            'INSTALL AUTO TRACKER UPDATE?\n\n'
+            + 'Current controller: v' + (controllerVersion || 'unknown') + '-r' + Number(controllerRevision || 0) + '\n'
+            + 'New release: v' + release.latestVersion + '-r' + Number(release.latestRevision || 0)
+            + details
+            + '\n\nThe controller and Tampermonkey files will be downloaded from the approved Google Drive release, SHA-256 verified, backed up, and replaced.'
+            + '\n\nAfter the userscript opens, approve the Tampermonkey update, then click "Restart Controller to Finish".'
+        );
+        if (!confirmed) return;
+
+        let installerWindow = null;
+        try {
+            installerWindow = window.open('about:blank', '_blank');
+            if (installerWindow) installerWindow.document.title = 'Auto Tracker Update';
+        } catch {}
+
+        showTrackerNotice('Downloading and verifying Auto Tracker update...', 15000);
+        api('POST', '/', { action:'install_release' }, result => {
+            if (!result || result.success === false) {
+                try { if (installerWindow && !installerWindow.closed) installerWindow.close(); } catch {}
+                const message = result?.message || result?.error || 'Update installation failed.';
+                showTrackerNotice('Update failed: ' + message, 16000);
+                log('⚠ Update failed: ' + message);
+                if (result?.updateInstall) updateInstallState = { ...updateInstallState, ...result.updateInstall };
+                renderUpdateInstallControls();
+                return;
+            }
+
+            if (result.updateInstall) updateInstallState = { ...updateInstallState, ...result.updateInstall };
+            else updateInstallState = {
+                state:'STAGED',
+                version:result.version || release.latestVersion,
+                revision:Number(result.revision ?? release.latestRevision ?? 0),
+                restartRequired:Boolean(result.restartRequired)
+            };
+
+            const applyUrl = String(result.applyUrl || (SERVER + '/tampermonkey.user.js'));
+            try {
+                if (installerWindow && !installerWindow.closed) {
+                    installerWindow.location.href = applyUrl;
+                } else {
+                    const opened = window.open(applyUrl, '_blank');
+                    if (!opened) showTrackerNotice('Update files are installed. Open ' + applyUrl + ' to approve the Tampermonkey update.', 18000);
+                }
+            } catch {
+                showTrackerNotice('Update files are installed. Open the Tampermonkey updater from System Status if the install page did not open.', 18000);
+            }
+
+            renderUpdateInstallControls();
+            showTrackerNotice(
+                'Update files verified and installed. Approve the Tampermonkey update, then click "Restart Controller to Finish".',
+                18000
+            );
+            log('Update staged: v' + String(result.version || release.latestVersion) + '-r' + Number(result.revision ?? release.latestRevision ?? 0));
+        });
+    });
+}
+
+function restartControllerAfterUpdate() {
+    if (!(updateInstallState?.state === 'STAGED' && updateInstallState?.restartRequired)) {
+        showTrackerNotice('There is no staged controller update waiting for restart.', 8000);
+        return;
+    }
+
+    const confirmed = window.confirm(
+        'RESTART CONTROLLER TO FINISH UPDATE?\n\n'
+        + 'Confirm the Tampermonkey Update/Install first.\n\n'
+        + 'The local controller will restart now. If your launcher does not reopen it automatically, start Auto Tracker again normally.'
+    );
+    if (!confirmed) return;
+
+    api('POST', '/', { action:'restart_controller' }, data => {
+        if (!data || data.success === false) {
+            showTrackerNotice(data?.message || 'Controller restart request failed.', 10000);
+            return;
+        }
+        showTrackerNotice('Controller restarting to finish the update...', 10000);
+        log('Controller restarting for update');
+        setTimeout(() => loadStats(), 3500);
+    });
+}
+
+function checkAutoTrackerRelease(showResult = true) {
+    api('POST', '/', { action:'check_for_updates' }, data => {
+        if (!data) {
+            if (showResult) showTrackerNotice('Update check failed: Controller did not respond.', 9000);
+            return;
+        }
+        latestReleaseState = data;
+        if (data.updateInstall) updateInstallState = { ...updateInstallState, ...data.updateInstall };
+        renderControllerIdentity();
+        if (!showResult) return;
+        if (data.integrityWarning) {
+            showTrackerNotice('⚠ RELEASE CONTENT CHANGED. Drive files do not match the approved release.json checksum. Update is blocked until the release is corrected.', 18000);
+        } else if (data.updateAvailable && data.latestVersion) {
+            const details = data.release?.details ? ' • ' + data.release.details : '';
+            showTrackerNotice(
+                'Update available: v' + data.latestVersion + '-r' + Number(data.latestRevision || 0)
+                + ' • ' + String(data.reason || 'UPDATE') + details,
+                15000
+            );
+        } else if (data.configured === false) {
+            showTrackerNotice('Release checking is not configured on Apps Script yet.', 9000);
+        } else {
+            showTrackerNotice('Auto Tracker v' + getInstalledTrackerVersion() + '-r' + TRACKER_RELEASE_REVISION + ' is up to date.', 7000);
+        }
+    });
+}
+
+// =========================================
+// FUNCTION LOAD STATS
+// Search: loadStats
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function loadStats() {
+
+    api("GET", "/stats", null, function (data) {
+        if (!data) return;
+        updateStats(data);
+        if (data.agentStatus) {
+            setStatus(data.agentStatus);
+        }
+    });
+
+}
+
+// =========================================
+// FUNCTION RESET IDLE TIMER
+// Search: resetIdleTimer
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function resetIdleTimer() {
+
+    clearTimeout(idleTimer);
+    lastActivityAt = Date.now();
+    if (!shiftStarted) {
+        if (currentStatus !== 'WAITING') setStatus('WAITING');
+        return;
+    }
+    if (currentStatus === 'BREAK' || breakState.onBreak || ['BIO', 'HBIO'].includes(currentStatus) || specialSessionState.activeType) {
+        return;
+    }
+    if (currentStatus === 'IDLE') {
+        const activityAt = lastActivityAt;
+        setStatus('ACTIVE');
+        console.log('Sending active_alert');
+        api('POST', '/', { action: 'active_alert', activityAt }, data => {
+            if (data?.status) setStatus(data.status);
+        });
+    }
+    const idleStartedAt = lastActivityAt + IDLE_TIMEOUT;
+    idleTimer = setTimeout(() => {
+        if (currentStatus === 'BREAK' || breakState.onBreak || ['BIO', 'HBIO'].includes(currentStatus) || specialSessionState.activeType) return;
+        console.log('Sending idle_alert');
+        api('POST', '/', { action: 'idle_alert', idleStartedAt }, data => {
+            if (['BREAK', 'BIO', 'HBIO'].includes(data?.status)) {
+                if (data?.specialSessionState) applySpecialSessionState(data.specialSessionState);
+                setStatus(data.status);
+                return;
+            }
+            setStatus(data?.status || 'IDLE');
+        });
+    }, IDLE_TIMEOUT);
+
+}
+
+function reconcileDelayedIdleBeforeActivity(activityAt = Date.now()) {
+
+    if (!shiftStarted || currentStatus === 'BREAK' || breakState.onBreak || ['BIO', 'HBIO'].includes(currentStatus) || specialSessionState.activeType) return;
+    const thresholdAt = Number(lastActivityAt || activityAt) + IDLE_TIMEOUT;
+    if (activityAt < thresholdAt || currentStatus === 'IDLE') return;
+    api('POST', '/', { action: 'idle_alert', idleStartedAt: thresholdAt }, idleData => {
+        if (!idleData || idleData.status !== 'IDLE') return;
+        api('POST', '/', { action: 'active_alert', activityAt }, activeData => {
+            if (activeData?.status) setStatus(activeData.status);
+        });
+    });
+
+}
+
+// =========================================
+// FUNCTION START IDLE TRACKING
+// Search: startIdleTracking
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function startIdleTracking() {
+
+    ["mousemove", "mousedown", "keydown", "wheel", "touchstart"].forEach(eventName => {
+        window.addEventListener(eventName, resetIdleTimer, true);
+    });
+    resetIdleTimer();
+
+}
+
+// =========================================
+// FUNCTION RESET LOCAL COUNTERS
+// Search: resetLocalCounters
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function resetLocalCounters(data) {
+
+    lastHandledSkipTime = 0;
+    lastHandledSkipKey = '';
+    pendingSkipKeys.clear();
+    initializeLocalCountersFromStats(data);
+
+}
+
+// =========================================
+// FUNCTION CONNECT EVENTS
+// Search: connectEvents
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.10 Alpha || 2026-09-24 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function connectEvents() {
+
+    if (eventSource) {
+        eventSource.close();
+    }
+    eventSource = new EventSource(SERVER + "/events");
+    eventSource.onopen = () => {
+        controllerConnected = true;
+        lastControllerSeenAt = Date.now();
+        renderControllerIdentity();
+        renderShiftWall();
+        log("Connected");
+    };
+    eventSource.onmessage = event => {
+        try {
+            const data = JSON.parse(event.data);
+            updateStats(data);
+            if (data.action === 'break_expired') {
+                showTrackerNotice(data.message || ((breakState.label || 'Break') + ' is finished. Status is now IDLE.'), 12000);
+            }
+            if (data.action === 'special_session_expired' || data.action === 'special_session_ended') {
+                showTrackerNotice(data.message || 'BIO/HBIO session ended. Work resumed.', 12000);
+            }
+            if (data.action === "interval_reset") {
+                const serverInterval = Number(data.currentInterval?.number);
+                console.log("🔄 INTERVAL RESET EVENT RECEIVED:", serverInterval);
+                if (Number.isFinite(serverInterval) && serverInterval >= 1) {
+                    currentIntervalNumber = serverInterval;
+                    if ($("interval")) {
+                        $("interval").innerText = getIntervalName(currentIntervalNumber);
+                    }
+                    log("🔄 Interval changed to " + getIntervalName(currentIntervalNumber));
+                    console.log("✅ Interval updated and saved:", currentIntervalNumber);
+                } else {
+                    console.warn("⚠️ Invalid interval_reset received:", data.currentInterval);
+                }
+                lastHandledSkipTime = 0;
+                lastHandledSkipKey = '';
+                pendingSkipKeys.clear();
+                initializeLocalCountersFromStats(data);
+                return;
+            }
+            if (data.action === "reset_counters") {
+                log("🔄 Counters Reset");
+                resetLocalCounters(data);
+            } else if (data.action === "reset_all_counters") {
+                log("🔄 Full Reset");
+                if (data.breakState) {
+                    applyBreakState(data.breakState);
+                } else {
+                    const fallbackMinutes = Number(shiftSchedule?.breakMinutes || getProspectiveShiftPolicy().breakMinutes || 30);
+                    const fallbackKind = fallbackMinutes >= 60 ? 'LUNCH' : 'BREAK';
+                    breakState = {
+                        onBreak:false,
+                        totalSeconds:fallbackMinutes * 60,
+                        usedSeconds:0,
+                        remainingSeconds:fallbackMinutes * 60,
+                        available:true,
+                        expired:false,
+                        allowanceMinutes:fallbackMinutes,
+                        kind:fallbackKind,
+                        label:fallbackKind === 'LUNCH' ? 'Lunch Break' : 'Break'
+                    };
+                }
+                specialSessionState = {
+                    activeType: null,
+                    BIO: { totalSecondsPerSession:900, maxSessions:1, currentSession:1, currentRemainingSeconds:900, sessionsRemainingAfterCurrent:0, exhausted:false, active:false },
+                    HBIO: { totalSecondsPerSession:600, maxSessions:1, currentSession:1, currentRemainingSeconds:600, sessionsRemainingAfterCurrent:0, exhausted:false, active:false }
+                };
+                updateBreakControl();
+                renderSpecialSessionControls();
+                resetLocalCounters(data);
+            } else {
+                initializeLocalCountersFromStats(data);
+                if (data.action) {
+                    log("Server: " + data.action);
+                }
+            }
+        } catch (err) {
+            console.error('❌ SSE update error:', err);
+            reportTrackerClientError('sse.message_parse', err, {
+                errorCode: 'ERR-FRONTEND-SSE-MESSAGE',
+                severity: 'ERROR',
+                endpoint: '/events'
+            });
+        }
+    };
+    eventSource.onerror = () => {
+        controllerConnected = false;
+        renderControllerIdentity();
+        renderShiftWall();
+        log('Reconnecting...');
+        const now = Date.now();
+        if (now - lastSseErrorReportAt >= 60000) {
+            lastSseErrorReportAt = now;
+            reportTrackerClientError('sse.connection', new Error('EventSource disconnected from the local controller.'), {
+                errorCode: 'ERR-FRONTEND-SSE-CONNECTION',
+                severity: 'WARN',
+                endpoint: '/events'
+            });
+        }
+        eventSource.close();
+        setTimeout(connectEvents, 3000);
+    };
+
+}
+
+// =========================================
+// FUNCTION HANDLE VISIBILITY CHANGE
+// Search: handleVisibilityChange
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function handleVisibilityChange() {
+
+    if (document.hidden) {
+        console.log("Tab Hidden");
+        api("POST", "/", {
+            action: "tab_hidden"
+        });
+    } else {
+        console.log("Tab Visible");
+        const activityAt = Date.now();
+        reconcileDelayedIdleBeforeActivity(activityAt);
+        api("POST", "/", {
+            action: "tab_visible"
+        });
+        resetIdleTimer();
+    }
+
+}
+
+// =========================================
+// FUNCTION HANDLE WINDOW BLUR
+// Search: handleWindowBlur
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function handleWindowBlur() {
+
+    console.log("Window Lost Focus");
+    api("POST", "/", {
+        action: "window_blur"
+    });
+
+}
+
+// =========================================
+// FUNCTION HANDLE WINDOW FOCUS
+// Search: handleWindowFocus
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function handleWindowFocus() {
+
+    console.log("Window Focused");
+    const activityAt = Date.now();
+    reconcileDelayedIdleBeforeActivity(activityAt);
+    api("POST", "/", {
+        action: "window_focus"
+    });
+    resetIdleTimer();
+
+}
+
+// =========================================
+// FUNCTION GET SUBMIT TASK SNAPSHOT
+// Search: getSubmitTaskSnapshot
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function getSubmitTaskSnapshot() {
+
+    const text = pageText();
+    return text.replace(/\s+/g, " ").trim();
+
+}
+
+// =========================================
+// FUNCTION WAIT FOR TASK CHANGE
+// Search: waitForTaskChange
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function waitForTaskChange(previousTaskPosition) {
+
+    let attempts = 0;
+    const checker = setInterval(() => {
+        attempts++;
+        const taskData = getCurrentTaskPosition();
+        if (taskData) {
+            const currentPosition = taskData.position;
+            console.log("🔎 Checking task position:", previousTaskPosition, "→", currentPosition);
+            if (previousTaskPosition !== null && currentPosition > previousTaskPosition) {
+                clearInterval(checker);
+                submitLocked = false;
+                submitRequestInProgress = false;
+                console.log("✅ Task position advanced:", previousTaskPosition, "→", currentPosition);
+                console.log("🔓 Submit unlocked.");
+                return;
+            }
+            if (taskData.total > 0 && currentPosition >= taskData.total) {
+                clearInterval(checker);
+                submitLocked = false;
+                submitRequestInProgress = false;
+                console.log("🏁 Job task limit reached:", currentPosition, "/", taskData.total);
+                console.log("🔓 Submit unlocked.");
+                return;
+            }
+        }
+        if (attempts >= 50) {
+            clearInterval(checker);
+            submitLocked = false;
+            submitRequestInProgress = false;
+            console.warn("⚠️ Task position did not advance.");
+            console.log("🔓 Submit unlocked by timeout.");
+        }
+    }, 100);
+
+}
+
+// =========================================
+// FUNCTION GET CURRENT TASK POSITION
+// Search: getCurrentTaskPosition
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function getCurrentTaskPosition() {
+
+    const text = pageText();
+    const match = text.match(/tasks?\s*:\s*(\d+)\s*\/\s*(\d+)/i);
+    if (!match) {
+        return null;
+    }
+    return {
+        position: parseInt(match[1], 10),
+        total: parseInt(match[2], 10)
+    };
+
+}
+
+// =========================================
+// FUNCTION PARSE COVERAGE METRICS
+// Search: parseCoverageMetrics
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function parseCoverageMetrics(text) {
+
+    const labels = {
+        emptyAreaConfirmation: /Out of Stock Confirmed\s*\(\s*(\d+)\s*\)/i,
+        emptyAreaNoMatchFound: /Empty Area\s*\(\s*(\d+)\s*\)/i,
+        unblurredPerson: /Unblurred Persons?\s*\(\s*(\d+)\s*\)/i,
+        deletedBoxes: /Deleted\s*\(\s*(\d+)\s*\)/i
+    };
+    const result = {};
+    for (const [key, pattern] of Object.entries(labels)) {
+        const match = text.match(pattern);
+        if (!match) return null;
+        result[key] = Number(match[1]);
+        if (!Number.isSafeInteger(result[key])) return null;
+    }
+    return result;
+
+}
+
+// =========================================
+// FUNCTION GET COVERAGE METRICS
+// Search: getCoverageMetrics
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function getCoverageMetrics() {
+
+    const headings = [...document.querySelectorAll('body *')].filter(el => !el.closest('#tracker-overlay') && el.getClientRects().length && /^(Out of Stock Confirmed|Empty Area|Unblurred Persons?|Deleted)\s*\(\s*\d+\s*\)$/i.test((el.textContent || '').trim())).map(el => el.textContent.trim());
+    return parseCoverageMetrics(headings.join('\n'));
+
+}
+
+// =========================================
+// FUNCTION IS SUBMIT TARGET
+// Search: isSubmitTarget
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function isSubmitTarget(target) {
+
+    if (!target || !(target instanceof Element)) {
+        return false;
+    }
+    if (target.closest("#tracker-overlay")) {
+        return false;
+    }
+    const candidates = [target.innerText, target.textContent, target.getAttribute("aria-label"), target.value, target.dataset && target.dataset.action];
+    return candidates.some(value => {
+        if (value == null) return false;
+        const normalized = String(value).replace(/\s+/g, " ").trim().toLowerCase();
+        return normalized === "submit" || normalized === "submit task";
+    });
+
+}
+    let lastHandledSkipTime = 0;
+    let lastHandledSkipKey = '';
+    const pendingSkipKeys = new Set();
+
+// =========================================
+// FUNCTION HANDLE SKIP
+// Search: handleSkip
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function handleSkip(event) {
+
+    if (!event.isTrusted) return;
+    const target = event.target instanceof Element ? event.target.closest('button, [role="button"], input[type="button"]') : null;
+    if (!target || target.disabled || target.getAttribute('aria-disabled') === 'true' || target.closest('#tracker-overlay')) return;
+    const labels = [target.innerText, target.textContent, target.getAttribute('aria-label'), target.value, target.dataset?.action];
+    if (!labels.some(value => /^(skip|skip task)$/i.test(String(value || '').trim()))) return;
+    if (!shiftStarted) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        showTrackerNotice('START SHIFT REQUIRED. Work was blocked so the tracker does not miss this task.', 10000);
+        renderShiftWall();
+        console.warn('Skip blocked because Start Shift has not been clicked.');
+        return;
+    }
+    const decision = modeMismatchDecision();
+    if (decision === 'block') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        log('⚠ Switch tracker to Coverage before continuing');
+        return;
+    }
+    if (decision === 'bypass' || trackingMode !== 2) {
+        console.warn('Skip continued without tracker counting because the page and tracker modes do not match.');
+        return;
+    }
+    const now = Date.now();
+    const taskData = getCurrentTaskPosition();
+    const jobId = getJobId();
+    const skipKey = taskData ? `${jobId}:${taskData.position}/${taskData.total}` : `${jobId}:unknown`;
+    const sameTaskRecentlyHandled = skipKey === lastHandledSkipKey && now - lastHandledSkipTime < 1500;
+    if (pendingSkipKeys.has(skipKey) || sameTaskRecentlyHandled) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        console.warn('⏳ Duplicate Skip for the same task was blocked.');
+        return;
+    }
+    lastHandledSkipTime = now;
+    lastHandledSkipKey = skipKey;
+    pendingSkipKeys.add(skipKey);
+    setTimeout(() => pendingSkipKeys.delete(skipKey), 3000);
+    resetIdleTimer();
+    api('POST', '/', {
+        action: 'coverage_skip',
+        pageMode: detectExpectedTrackingMode(),
+        requestId: createRequestId(),
+        jobId,
+        submittedTaskPosition: taskData?.position ?? null,
+        totalTasks: taskData?.total ?? 0,
+        isJobFinished: Boolean(taskData && taskData.total > 0 && taskData.position >= taskData.total)
+    }, data => {
+        pendingSkipKeys.delete(skipKey);
+        if (data?.error === 'TRACKING_MODE_MISMATCH') refreshModeMismatchWarning();
+        if (data) updateStats(data);
+    });
+
+}
+
+// =========================================
+// FUNCTION HANDLE SUBMIT
+// Search: handleSubmit
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.7 Alpha || 2026-09-14 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// =========================================
+function handleSubmit(event) {
+
+    if (!event.isTrusted) return;
+    const target = event.target instanceof Element ? event.target.closest('button, [role="button"], input[type="submit"]') : null;
+    if (!target || target.disabled || target.getAttribute('aria-disabled') === 'true') return;
+    const isSubmit = isSubmitTarget(target);
+    if (!isSubmit || target.closest('#tracker-overlay')) return;
+    if (!shiftStarted) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        showTrackerNotice('START SHIFT REQUIRED. Work was blocked so the tracker does not miss this task.', 10000);
+        renderShiftWall();
+        console.warn('Submit blocked because Start Shift has not been clicked.');
+        return;
+    }
+    const decision = modeMismatchDecision();
+    if (decision === 'block') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        log('⚠ Switch tracker to Coverage before submitting');
+        return;
+    }
+    if (decision === 'bypass') {
+        console.warn('Submit continued without tracker counting because the page and tracker modes do not match.');
+        return;
+    }
+    console.log('🎯 VALID SUBMIT CLICK:', target.tagName, target.innerText?.trim());
+    const now = Date.now();
+    if (now - lastHandledSubmitTime < SUBMIT_DEBOUNCE_MS || submitLocked || submitRequestInProgress) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        console.warn('⏳ Duplicate Submit click blocked until the current task changes.');
+        return;
+    }
+    const coverageMetrics = trackingMode === 2 ? getCoverageMetrics() : null;
+    if (trackingMode === 2 && !coverageMetrics) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        log('⚠ Coverage submit blocked: unable to read the four Coverage counters.');
+        console.warn('Coverage snapshot missing; Submit blocked to protect tracker accuracy.');
+        return;
+    }
+    submitLocked = true;
+    submitRequestInProgress = true;
+    lastHandledSubmitTime = now;
+    const previousTaskSnapshot = getSubmitTaskSnapshot();
+    const previousTaskData = getCurrentTaskPosition();
+    const previousTaskPosition = previousTaskData ? previousTaskData.position : null;
+    const previousTotalTasks = previousTaskData ? previousTaskData.total : null;
+    resetIdleTimer();
+    const jobId = getJobId();
+    let isJobFinished = false;
+    const currentTaskData = getCurrentTaskPosition();
+    if (currentTaskData) {
+        const current = currentTaskData.position;
+        const total = currentTaskData.total;
+        isJobFinished = Number.isFinite(current) && Number.isFinite(total) && total > 0 && current >= total;
+    }
+    const requestId = createRequestId();
+    api('POST', '/', {
+        action: 'click_submit',
+        pageMode: detectExpectedTrackingMode(),
+        coverageMetrics,
+        requestId,
+        jobId,
+        isJobFinished,
+        intervalNumber: currentIntervalNumber,
+        submittedTaskPosition: previousTaskPosition,
+        submittedTaskSnapshot: previousTaskSnapshot,
+        totalTasks: previousTotalTasks || 0
+    }, data => {
+        if (!data || data.success === false || data.error) {
+            submitRequestInProgress = false;
+            submitLocked = false;
+            if (data?.error === 'TRACKING_MODE_MISMATCH') refreshModeMismatchWarning();
+            console.warn('⚠️ Submit received no accepted response.', data);
+            return;
+        }
+        if (typeof data.allTimeTasks === 'number') localCounters.totalTaskCompleted = data.allTimeTasks;
+        if (typeof data.totalTaskCompleted === 'number') localCounters.totalTaskCompleted = data.totalTaskCompleted;
+        if (typeof data.totalJobsCompleted === 'number') localCounters.totalJobsCompleted = data.totalJobsCompleted;
+        updateStats(data);
+        log(`✅ Task submitted ${isJobFinished ? '(Job Complete)' : ''}`);
+        if (previousTaskPosition !== null) {
+            waitForTaskChange(previousTaskPosition);
+        } else {
+            setTimeout(() => {
+                submitLocked = false;
+                submitRequestInProgress = false;
+            }, 5000);
+        }
+    });
+
+}
+
+// =========================================
+// FUNCTION MONITOR JOB
+// Search: monitorJob
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// =========================================
+function monitorJob() {
+
+    const newJobId = getJobId();
+    if (!newJobId || newJobId === "No Jobs Detected" || newJobId === lastJobId) {
+        return;
+    }
+    api("POST", "/", {
+        action: "job_changed",
+        previousJobId: lastJobId,
+        newJobId,
+        newUrl: location.href,
+        newDescription: window.location.pathname
+    });
+    lastJobId = newJobId;
+    log("Job: " + newJobId);
+
+}
+
+// =========================================
+// FUNCTION INIT
+// Search: init
+// Ver 0.0.5 Alpha || 2026-09-07 || JBallados
+// Ver 0.0.12 Alpha || 2026-09-27 || JBallados
+// Ver 0.1.16 Alpha || 2026-09-28 || JBallados || Error_Logging
+// =========================================
+function init() {
+
+    installTrackerClientErrorLogging();
+    console.log('🚀 Initializing Trinovation Auto Count Tracker...');
+    const initialStats = {
+        totalTaskCompleted: 0,
+        totalJobsCompleted: 0,
+        currentJobId: getJobId(),
+        agentStatus: 'WAITING',
+        shiftStarted: false,
+        shiftStartedAt: null,
+        currentInterval: { number: 1, tasks: 0 }
+    };
+    createOverlay(initialStats);
+    ensureShiftWall();
+    renderControllerIdentity();
+    renderShiftWall();
+    if (String(GM_getValue('trackerPrivacyNoticeVersionAccepted', '')) !== '1.0') {
+        setTimeout(() => showPrivacyNotice(), 600);
+    }
+    startClock();
+    startIdleTracking();
+    connectEvents();
+    api('POST', '/', { action:'browser_hello', browserInfo:getTrackerBrowserInfo() }, () => {});
+    window.addEventListener('click', handleSkip, true);
+    window.addEventListener('click', handleSubmit, true);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('focus', handleWindowFocus);
+    setInterval(monitorJob, 1000);
+    setInterval(() => {
+        applyDockLayout();
+        refreshModeMismatchWarning();
+        if (controllerConnected && lastControllerSeenAt && Date.now() - lastControllerSeenAt > 15000) {
+            loadStats();
+        }
+        renderControllerIdentity();
+        renderShiftWall();
+    }, 1000);
+    api('GET', '/stats', null, stats => {
+        if (!stats) {
+            setControllerConnection(false);
+            log('Server unavailable');
+            renderShiftWall();
+            return;
+        }
+        initializeLocalCountersFromStats(stats);
+        updateStats(stats);
+        if (stats.agentStatus) setStatus(stats.agentStatus);
+        if (stats.latestRelease?.updateAvailable) latestReleaseState = stats.latestRelease;
+        log('Ready');
+    });
+    log('Connecting...');
+
+}
+    if (document.readyState === "loading") {
+        window.addEventListener("DOMContentLoaded", init, {
+            once: true
+        });
+    } else {
+        init();
+    }
+})();
